@@ -340,17 +340,11 @@ pub fn zeroes(comptime T: type) T {
         },
         .Struct => |struct_info| {
             if (@sizeOf(T) == 0) return T{};
-            if (comptime meta.containerLayout(T) == .Extern) {
-                var item: T = undefined;
-                @memset(@ptrCast([*]u8, &item), 0, @sizeOf(T));
-                return item;
-            } else {
-                var structure: T = undefined;
-                inline for (struct_info.fields) |field| {
-                    @field(structure, field.name) = zeroes(@TypeOf(@field(structure, field.name)));
-                }
-                return structure;
+            var structure: T = undefined;
+            inline for (struct_info.fields) |field| {
+                @field(structure, field.name) = zeroes(@TypeOf(@field(structure, field.name)));
             }
+            return structure;
         },
         .Pointer => |ptr_info| {
             switch (ptr_info.size) {
@@ -450,6 +444,14 @@ test "mem.zeroes" {
         testing.expectEqual(@as(u32, 0), e);
     }
     testing.expectEqual(@as(?u8, null), b.optional_int);
+
+    comptime { 
+        var c = zeroes(C_struct);
+        c.x += 2;
+
+        testing.expectEqual(@as(u32, 2), c.x);
+        testing.expectEqual(@as(u32, 0), c.y);
+    }
 }
 
 pub fn secureZero(comptime T: type, s: []T) void {
