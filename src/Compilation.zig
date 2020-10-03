@@ -1525,7 +1525,6 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *
 
     const c_source_basename = std.fs.path.basename(c_object.src.src_path);
 
-    // @TODO Check
     c_comp_progress_node.activate();
     var child_progress_node = c_comp_progress_node.start(c_source_basename, null);
     child_progress_node.activate();
