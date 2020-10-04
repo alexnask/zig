@@ -9,9 +9,9 @@ const ArrayList = std.ArrayList;
 const ast = std.zig.ast;
 const warn = std.log.warn;
 
-const Compilation = @import("Compilation.zig");
+pub const Compilation = @import("Compilation.zig");
 const link = @import("link.zig");
-const Package = @import("Package.zig");
+pub const Package = @import("Package.zig");
 const zir = @import("zir.zig");
 const build_options = @import("build_options");
 const introspect = @import("introspect.zig");
