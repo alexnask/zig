@@ -490,14 +490,20 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
 
         const dll_export_fns = if (options.dll_export_fns) |explicit| explicit else is_dyn_lib;
 
-        const libc_dirs = try detectLibCIncludeDirs(
-            arena,
-            options.zig_lib_directory.path.?,
-            options.target,
-            options.is_native_os,
-            link_libc,
-            options.libc_installation,
-        );
+        const libc_dirs = if (std.builtin.arch == .wasm32)
+            LibCDirs{
+                .libc_include_dir_list = &[0][]const u8{},
+                .libc_installation = null,
+            }
+        else
+            try detectLibCIncludeDirs(
+                arena,
+                options.zig_lib_directory.path.?,
+                options.target,
+                options.is_native_os,
+                link_libc,
+                options.libc_installation,
+            );
 
         const must_pic: bool = b: {
             if (target_util.requiresPIC(options.target, link_libc))
