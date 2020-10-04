@@ -951,7 +951,7 @@ fn commandSize(min_size: anytype) u32 {
 fn addPadding(self: *MachO, size: u64, file_offset: u64) !void {
     if (size == 0) return;
 
-    const buf = try self.base.allocator.alloc(u8, size);
+    const buf = try self.base.allocator.alloc(u8, @intCast(usize, size));
     defer self.base.allocator.free(buf);
 
     mem.set(u8, buf[0..], 0);

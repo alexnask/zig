@@ -538,7 +538,8 @@ pub fn determineMode(options: Options) fs.File.Mode {
     // with 0o755 permissions, but it works appropriately if the system is configured
     // more leniently. As another data point, C's fopen seems to open files with the
     // 666 mode.
-    const executable_mode = if (std.Target.current.os.tag == .windows) 0 else 0o777;
+    const os_tag = std.Target.current.os.tag;
+    const executable_mode = if (os_tag == .windows or os_tag == .wasi) 0 else 0o777;
     switch (options.effectiveOutputMode()) {
         .Lib => return switch (options.link_mode) {
             .Dynamic => executable_mode,

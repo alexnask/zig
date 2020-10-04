@@ -881,7 +881,7 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
             @panic("TODO: handle .debug_info header exceeding its padding");
         }
         const jmp_amt = first_dbg_info_decl.dbg_info_off - di_buf.items.len;
-        try self.pwriteDbgInfoNops(0, di_buf.items, jmp_amt, false, debug_info_sect.sh_offset);
+        try self.pwriteDbgInfoNops(0, di_buf.items, jmp_amt, false, @intCast(usize, debug_info_sect.sh_offset));
         self.debug_info_header_dirty = false;
     }
 
@@ -1050,7 +1050,7 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
             @panic("TODO: handle .debug_line header exceeding its padding");
         }
         const jmp_amt = dbg_line_prg_off - di_buf.items.len;
-        try self.pwriteDbgLineNops(0, di_buf.items, jmp_amt, debug_line_sect.sh_offset);
+        try self.pwriteDbgLineNops(0, di_buf.items, jmp_amt, @intCast(usize, debug_line_sect.sh_offset));
         self.debug_line_header_dirty = false;
     }
 
@@ -1938,7 +1938,7 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
                 const sym = self.local_symbols.items[last.local_sym_index];
                 break :blk (sym.st_value + sym.st_size) - phdr.p_vaddr;
             } else 0;
-            const amt = try self.base.file.?.copyRangeAll(shdr.sh_offset, self.base.file.?, new_offset, text_size);
+            const amt = try self.base.file.?.copyRangeAll(shdr.sh_offset, self.base.file.?, new_offset, @intCast(usize, text_size));
             if (amt != text_size) return error.InputOutput;
             shdr.sh_offset = new_offset;
             phdr.p_offset = new_offset;
@@ -2307,7 +2307,7 @@ pub fn updateDecl(self: *Elf, module: *Module, decl: *Module.Decl) !void {
                     src_fn.next = null;
                     // Populate where it used to be with NOPs.
                     const file_pos = debug_line_sect.sh_offset + src_fn.off;
-                    try self.pwriteDbgLineNops(0, &[0]u8{}, src_fn.len, file_pos);
+                    try self.pwriteDbgLineNops(0, &[0]u8{}, src_fn.len, @intCast(usize, file_pos));
                     // TODO Look at the free list before appending at the end.
                     src_fn.prev = last;
                     last.next = src_fn;
@@ -2357,7 +2357,7 @@ pub fn updateDecl(self: *Elf, module: *Module, decl: *Module.Decl) !void {
         // We only have support for one compilation unit so far, so the offsets are directly
         // from the .debug_line section.
         const file_pos = debug_line_sect.sh_offset + src_fn.off;
-        try self.pwriteDbgLineNops(prev_padding_size, dbg_line_buffer.items, next_padding_size, file_pos);
+        try self.pwriteDbgLineNops(prev_padding_size, dbg_line_buffer.items, next_padding_size, @intCast(usize, file_pos));
 
         // .debug_info - End the TAG_subprogram children.
         try dbg_info_buffer.append(0);
@@ -2452,7 +2452,7 @@ fn updateDeclDebugInfoAllocation(self: *Elf, text_block: *TextBlock, len: u32) !
                 text_block.dbg_info_next = null;
                 // Populate where it used to be with NOPs.
                 const file_pos = debug_info_sect.sh_offset + text_block.dbg_info_off;
-                try self.pwriteDbgInfoNops(0, &[0]u8{}, text_block.dbg_info_len, false, file_pos);
+                try self.pwriteDbgInfoNops(0, &[0]u8{}, text_block.dbg_info_len, false, @intCast(usize, file_pos));
                 // TODO Look at the free list before appending at the end.
                 text_block.dbg_info_prev = last;
                 last.dbg_info_next = text_block;
@@ -2523,7 +2523,7 @@ fn writeDeclDebugInfo(self: *Elf, text_block: *TextBlock, dbg_info_buf: []const 
     // We only have support for one compilation unit so far, so the offsets are directly
     // from the .debug_info section.
     const file_pos = debug_info_sect.sh_offset + text_block.dbg_info_off;
-    try self.pwriteDbgInfoNops(prev_padding_size, dbg_info_buf, next_padding_size, trailing_zero, file_pos);
+    try self.pwriteDbgInfoNops(prev_padding_size, dbg_info_buf, next_padding_size, trailing_zero, @intCast(usize, file_pos));
 }
 
 pub fn updateDeclExports(
@@ -2683,7 +2683,7 @@ fn writeOffsetTableEntry(self: *Elf, index: usize) !void {
         if (needed_size > allocated_size) {
             // Must move the entire got section.
             const new_offset = self.findFreeSpace(needed_size, entry_size);
-            const amt = try self.base.file.?.copyRangeAll(shdr.sh_offset, self.base.file.?, new_offset, shdr.sh_size);
+            const amt = try self.base.file.?.copyRangeAll(shdr.sh_offset, self.base.file.?, new_offset, @intCast(usize, shdr.sh_size));
             if (amt != shdr.sh_size) return error.InputOutput;
             shdr.sh_offset = new_offset;
             phdr.p_offset = new_offset;
@@ -2740,7 +2740,7 @@ fn writeSymbol(self: *Elf, index: usize) !void {
             // Move all the symbols to a new file location.
             const new_offset = self.findFreeSpace(needed_size, sym_align);
             const existing_size = @as(u64, syms_sect.sh_info) * sym_size;
-            const amt = try self.base.file.?.copyRangeAll(syms_sect.sh_offset, self.base.file.?, new_offset, existing_size);
+            const amt = try self.base.file.?.copyRangeAll(syms_sect.sh_offset, self.base.file.?, new_offset, @intCast(usize, existing_size));
             if (amt != existing_size) return error.InputOutput;
             syms_sect.sh_offset = new_offset;
         }

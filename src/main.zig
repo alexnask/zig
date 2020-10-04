@@ -2534,7 +2534,7 @@ fn fmtPathFile(
     const source_code = source_file.readToEndAllocOptions(
         fmt.gpa,
         max_src_size,
-        stat.size,
+        @intCast(usize, stat.size),
         @alignOf(u8),
         null,
     ) catch |err| switch (err) {
