@@ -45,6 +45,7 @@ pub const Options = struct {
     program_code_size_hint: u64 = 256 * 1024,
     entry_addr: ?u64 = null,
     stack_size_override: ?u64,
+    image_base_override: ?u64,
     /// Set to `true` to omit debug info.
     strip: bool,
     /// If this is true then this link code is responsible for outputting an object
@@ -60,6 +61,7 @@ pub const Options = struct {
     link_libcpp: bool,
     function_sections: bool,
     eh_frame_hdr: bool,
+    emit_relocs: bool,
     rdynamic: bool,
     z_nodelete: bool,
     z_defs: bool,
@@ -86,6 +88,8 @@ pub const Options = struct {
     llvm_cpu_features: ?[*:0]const u8,
     /// Extra args passed directly to LLD. Ignored when not linking with LLD.
     extra_lld_args: []const []const u8,
+    /// Darwin-only. Set the root path to the system libraries and frameworks.
+    syslibroot: ?[]const u8,
 
     objects: []const []const u8,
     framework_dirs: []const []const u8,
@@ -129,6 +133,14 @@ pub const File = struct {
         macho: MachO.SrcFn,
         c: void,
         wasm: ?Wasm.FnData,
+    };
+
+    pub const Export = union {
+        elf: Elf.Export,
+        coff: void,
+        macho: MachO.Export,
+        c: void,
+        wasm: void,
     };
 
     /// For DWARF .debug_info.
@@ -425,7 +437,8 @@ pub const File = struct {
                     .target = base.options.target,
                     .output_mode = .Obj,
                 });
-                const full_obj_path = try directory.join(arena, &[_][]const u8{obj_basename});
+                const o_directory = base.options.module.?.zig_cache_artifact_directory;
+                const full_obj_path = try o_directory.join(arena, &[_][]const u8{obj_basename});
                 break :blk full_obj_path;
             }
             try base.flushModule(comp);
@@ -456,8 +469,12 @@ pub const File = struct {
         const digest = ch.final();
 
         var prev_digest_buf: [digest.len]u8 = undefined;
-        const prev_digest: []u8 = directory.handle.readLink(id_symlink_basename, &prev_digest_buf) catch |err| b: {
-            log.debug("archive new_digest={} readlink error: {}", .{ digest, @errorName(err) });
+        const prev_digest: []u8 = Cache.readSmallFile(
+            directory.handle,
+            id_symlink_basename,
+            &prev_digest_buf,
+        ) catch |err| b: {
+            log.debug("archive new_digest={} readFile error: {}", .{ digest, @errorName(err) });
             break :b prev_digest_buf[0..0];
         };
         if (mem.eql(u8, prev_digest, &digest)) {
@@ -502,8 +519,8 @@ pub const File = struct {
         const bad = llvm.WriteArchive(full_out_path_z, object_files.items.ptr, object_files.items.len, os_type);
         if (bad) return error.UnableToWriteArchive;
 
-        directory.handle.symLink(&digest, id_symlink_basename, .{}) catch |err| {
-            std.log.warn("failed to save archive hash digest symlink: {}", .{@errorName(err)});
+        Cache.writeSmallFile(directory.handle, id_symlink_basename, &digest) catch |err| {
+            std.log.warn("failed to save archive hash digest file: {}", .{@errorName(err)});
         };
 
         ch.writeManifest() catch |err| {

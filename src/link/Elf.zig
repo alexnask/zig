@@ -27,9 +27,6 @@ const Cache = @import("../Cache.zig");
 
 const default_entry_addr = 0x8000000;
 
-// TODO Turn back on zig fmt when https://github.com/ziglang/zig/issues/5948 is implemented.
-// zig fmt: off
-
 pub const base_tag: File.Tag = .elf;
 
 base: File,
@@ -273,8 +270,8 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
 
 pub fn createEmpty(gpa: *Allocator, options: link.Options) !*Elf {
     const ptr_width: PtrWidth = switch (options.target.cpu.arch.ptrBitWidth()) {
-        0 ... 32 => .p32,
-        33 ... 64 => .p64,
+        0...32 => .p32,
+        33...64 => .p64,
         else => return error.UnsupportedELFArchitecture,
     };
     const self = try gpa.create(Elf);
@@ -752,40 +749,52 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
         // These are LEB encoded but since the values are all less than 127
         // we can simply append these bytes.
         const abbrev_buf = [_]u8{
-            abbrev_compile_unit,     DW.TAG_compile_unit,     DW.CHILDREN_yes, // header
-            DW.AT_stmt_list,         DW.FORM_sec_offset,      DW.AT_low_pc,
-            DW.FORM_addr,            DW.AT_high_pc,           DW.FORM_addr,
-            DW.AT_name,              DW.FORM_strp,            DW.AT_comp_dir,
-            DW.FORM_strp,            DW.AT_producer,          DW.FORM_strp,
-            DW.AT_language,          DW.FORM_data2,           0,
+            abbrev_compile_unit, DW.TAG_compile_unit, DW.CHILDREN_yes, // header
+            DW.AT_stmt_list,     DW.FORM_sec_offset,  DW.AT_low_pc,
+            DW.FORM_addr,        DW.AT_high_pc,       DW.FORM_addr,
+            DW.AT_name,          DW.FORM_strp,        DW.AT_comp_dir,
+            DW.FORM_strp,        DW.AT_producer,      DW.FORM_strp,
+            DW.AT_language,      DW.FORM_data2,       0,
             0, // table sentinel
-                                      abbrev_subprogram,       DW.TAG_subprogram,
+            abbrev_subprogram,
+            DW.TAG_subprogram,
             DW.CHILDREN_yes, // header
-                        DW.AT_low_pc,            DW.FORM_addr,
-            DW.AT_high_pc,           DW.FORM_data4,           DW.AT_type,
-            DW.FORM_ref4,            DW.AT_name,              DW.FORM_string,
-            0,                       0, // table sentinel
-                                      abbrev_subprogram_retvoid,
-            DW.TAG_subprogram,       DW.CHILDREN_yes, // header
-                        DW.AT_low_pc,
-            DW.FORM_addr,            DW.AT_high_pc,           DW.FORM_data4,
-            DW.AT_name,              DW.FORM_string,          0,
+            DW.AT_low_pc,
+            DW.FORM_addr,
+            DW.AT_high_pc,
+            DW.FORM_data4,
+            DW.AT_type,
+            DW.FORM_ref4,
+            DW.AT_name,
+            DW.FORM_string,
+            0,                         0, // table sentinel
+            abbrev_subprogram_retvoid,
+            DW.TAG_subprogram, DW.CHILDREN_yes, // header
+            DW.AT_low_pc,      DW.FORM_addr,
+            DW.AT_high_pc,     DW.FORM_data4,
+            DW.AT_name,        DW.FORM_string,
+            0,
             0, // table sentinel
-                                      abbrev_base_type,        DW.TAG_base_type,
+            abbrev_base_type,
+            DW.TAG_base_type,
             DW.CHILDREN_no, // header
-                         DW.AT_encoding,          DW.FORM_data1,
-            DW.AT_byte_size,         DW.FORM_data1,           DW.AT_name,
-            DW.FORM_string,          0,                       0, // table sentinel
-
-            abbrev_pad1,             DW.TAG_unspecified_type, DW.CHILDREN_no, // header
-            0,                       0, // table sentinel
-                                      abbrev_parameter,
+            DW.AT_encoding,
+            DW.FORM_data1,
+            DW.AT_byte_size,
+            DW.FORM_data1,
+            DW.AT_name,
+            DW.FORM_string, 0, 0, // table sentinel
+            abbrev_pad1, DW.TAG_unspecified_type, DW.CHILDREN_no, // header
+            0,                0, // table sentinel
+            abbrev_parameter,
             DW.TAG_formal_parameter, DW.CHILDREN_no, // header
-                         DW.AT_location,
-            DW.FORM_exprloc,         DW.AT_type,              DW.FORM_ref4,
-            DW.AT_name,              DW.FORM_string,          0,
+            DW.AT_location,          DW.FORM_exprloc,
+            DW.AT_type,              DW.FORM_ref4,
+            DW.AT_name,              DW.FORM_string,
+            0,
             0, // table sentinel
-                                      0,                       0,
+            0,
+            0,
             0, // section sentinel
         };
 
@@ -1021,7 +1030,6 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
             0, // `DW.LNS_set_prologue_end`
             0, // `DW.LNS_set_epilogue_begin`
             1, // `DW.LNS_set_isa`
-
             0, // include_directories (none except the compilation unit cwd)
         });
         // file_names[0]
@@ -1284,8 +1292,10 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         // We can skip hashing libc and libc++ components that we are in charge of building from Zig
         // installation sources because they are always a product of the compiler version + target information.
         man.hash.add(stack_size);
+        man.hash.addOptional(self.base.options.image_base_override);
         man.hash.add(gc_sections);
         man.hash.add(self.base.options.eh_frame_hdr);
+        man.hash.add(self.base.options.emit_relocs);
         man.hash.add(self.base.options.rdynamic);
         man.hash.addListOfBytes(self.base.options.extra_lld_args);
         man.hash.addListOfBytes(self.base.options.lib_dirs);
@@ -1316,8 +1326,12 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         digest = man.final();
 
         var prev_digest_buf: [digest.len]u8 = undefined;
-        const prev_digest: []u8 = directory.handle.readLink(id_symlink_basename, &prev_digest_buf) catch |err| blk: {
-            log.debug("ELF LLD new_digest={} readlink error: {}", .{digest, @errorName(err)});
+        const prev_digest: []u8 = Cache.readSmallFile(
+            directory.handle,
+            id_symlink_basename,
+            &prev_digest_buf,
+        ) catch |err| blk: {
+            log.debug("ELF LLD new_digest={} error: {}", .{ digest, @errorName(err) });
             // Handle this as a cache miss.
             break :blk prev_digest_buf[0..0];
         };
@@ -1327,7 +1341,7 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
             self.base.lock = man.toOwnedLock();
             return;
         }
-        log.debug("ELF LLD prev_digest={} new_digest={}", .{prev_digest, digest});
+        log.debug("ELF LLD prev_digest={} new_digest={}", .{ prev_digest, digest });
 
         // We are about to change the output file to be different, so we invalidate the build hash now.
         directory.handle.deleteFile(id_symlink_basename) catch |err| switch (err) {
@@ -1352,6 +1366,10 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         try argv.append(try std.fmt.allocPrint(arena, "stack-size={}", .{stack_size}));
     }
 
+    if (self.base.options.image_base_override) |image_base| {
+        try argv.append(try std.fmt.allocPrint(arena, "--image-base={d}", .{image_base}));
+    }
+
     if (self.base.options.linker_script) |linker_script| {
         try argv.append("-T");
         try argv.append(linker_script);
@@ -1363,6 +1381,10 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
 
     if (self.base.options.eh_frame_hdr) {
         try argv.append("--eh-frame-hdr");
+    }
+
+    if (self.base.options.emit_relocs) {
+        try argv.append("--emit-relocs");
     }
 
     if (self.base.options.rdynamic) {
@@ -1410,7 +1432,7 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
 
     if (link_in_crt) {
         const crt1o: []const u8 = o: {
-            if (target.os.tag == .netbsd) {
+            if (target.os.tag == .netbsd or target.os.tag == .openbsd) {
                 break :o "crt0.o";
             } else if (target.isAndroid()) {
                 if (self.base.options.link_mode == .Dynamic) {
@@ -1428,6 +1450,9 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         if (target_util.libc_needs_crti_crtn(target)) {
             try argv.append(try comp.get_libc_crt_file(arena, "crti.o"));
         }
+        if (target.os.tag == .openbsd) {
+            try argv.append(try comp.get_libc_crt_file(arena, "crtbegin.o"));
+        }
     }
 
     // rpaths
@@ -1443,10 +1468,11 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         var test_path = std.ArrayList(u8).init(self.base.allocator);
         defer test_path.deinit();
         for (self.base.options.lib_dirs) |lib_dir_path| {
-            for (self.base.options.system_libs.items()) |link_lib| {
+            for (self.base.options.system_libs.items()) |entry| {
+                const link_lib = entry.key;
                 test_path.shrinkRetainingCapacity(0);
                 const sep = fs.path.sep_str;
-                try test_path.writer().print("{}" ++ sep ++ "lib{}.so", .{ lib_dir_path, link_lib });
+                try test_path.writer().print("{s}" ++ sep ++ "lib{s}.so", .{ lib_dir_path, link_lib });
                 fs.cwd().access(test_path.items, .{}) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => |e| return e,
@@ -1480,9 +1506,9 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
 
     if (is_dyn_lib) {
         const soname = self.base.options.override_soname orelse if (self.base.options.version) |ver|
-                try std.fmt.allocPrint(arena, "lib{}.so.{}", .{self.base.options.root_name, ver.major})
-            else
-                try std.fmt.allocPrint(arena, "lib{}.so", .{self.base.options.root_name});
+            try std.fmt.allocPrint(arena, "lib{}.so.{}", .{ self.base.options.root_name, ver.major })
+        else
+            try std.fmt.allocPrint(arena, "lib{}.so", .{self.base.options.root_name});
         try argv.append("-soname");
         try argv.append(soname);
 
@@ -1571,6 +1597,8 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     if (link_in_crt) {
         if (target.isAndroid()) {
             try argv.append(try comp.get_libc_crt_file(arena, "crtend_android.o"));
+        } else if (target.os.tag == .openbsd) {
+            try argv.append(try comp.get_libc_crt_file(arena, "crtend.o"));
         } else if (target_util.libc_needs_crti_crtn(target)) {
             try argv.append(try comp.get_libc_crt_file(arena, "crtn.o"));
         }
@@ -1605,7 +1633,11 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     };
     defer stdout_context.data.deinit();
     const llvm = @import("../llvm.zig");
-    const ok = llvm.Link(.ELF, new_argv.ptr, new_argv.len, append_diagnostic,
+    const ok = llvm.Link(
+        .ELF,
+        new_argv.ptr,
+        new_argv.len,
+        append_diagnostic,
         @ptrToInt(&stdout_context),
         @ptrToInt(&stderr_context),
     );
@@ -1624,14 +1656,14 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     }
 
     if (!self.base.options.disable_lld_caching) {
-        // Update the dangling symlink with the digest. If it fails we can continue; it only
+        // Update the file with the digest. If it fails we can continue; it only
         // means that the next invocation will have an unnecessary cache miss.
-        directory.handle.symLink(&digest, id_symlink_basename, .{}) catch |err| {
-            std.log.warn("failed to save linking hash digest symlink: {}", .{@errorName(err)});
+        Cache.writeSmallFile(directory.handle, id_symlink_basename, &digest) catch |err| {
+            std.log.warn("failed to save linking hash digest file: {}", .{@errorName(err)});
         };
         // Again failure here only means an unnecessary cache miss.
         man.writeManifest() catch |err| {
-            std.log.warn("failed to write cache manifest when linking: {}", .{ @errorName(err) });
+            std.log.warn("failed to write cache manifest when linking: {}", .{@errorName(err)});
         };
         // We hang on to this lock so that the output file path can be used without
         // other processes clobbering it.
@@ -2565,7 +2597,7 @@ pub fn updateDeclExports(
             },
         };
         const stt_bits: u8 = @truncate(u4, decl_sym.st_info);
-        if (exp.link.sym_index) |i| {
+        if (exp.link.elf.sym_index) |i| {
             const sym = &self.global_symbols.items[i];
             sym.* = .{
                 .st_name = try self.updateString(sym.st_name, exp.options.name),
@@ -2590,7 +2622,7 @@ pub fn updateDeclExports(
                 .st_size = decl_sym.st_size,
             };
 
-            exp.link.sym_index = @intCast(u32, i);
+            exp.link.elf.sym_index = @intCast(u32, i);
         }
     }
 }
@@ -2674,7 +2706,7 @@ fn writeOffsetTableEntry(self: *Elf, index: usize) !void {
     if (self.offset_table_count_dirty) {
         // TODO Also detect virtual address collisions.
         const allocated_size = self.allocatedSize(shdr.sh_offset);
-        const needed_size = self.local_symbols.items.len * entry_size;
+        const needed_size = self.offset_table.items.len * entry_size;
         if (needed_size > allocated_size) {
             // Must move the entire got section.
             const new_offset = self.findFreeSpace(needed_size, entry_size);
@@ -2866,8 +2898,8 @@ fn dbgLineNeededHeaderBytes(self: Elf) u32 {
     const root_src_dir_path_len = if (self.base.options.module.?.root_pkg.root_src_directory.path) |p| p.len else 1; // "."
     return @intCast(u32, 53 + directory_entry_format_count * 2 + file_name_entry_format_count * 2 +
         directory_count * 8 + file_name_count * 8 +
-    // These are encoded as DW.FORM_string rather than DW.FORM_strp as we would like
-    // because of a workaround for readelf and gdb failing to understand DWARFv5 correctly.
+        // These are encoded as DW.FORM_string rather than DW.FORM_strp as we would like
+        // because of a workaround for readelf and gdb failing to understand DWARFv5 correctly.
         root_src_dir_path_len +
         self.base.options.module.?.root_pkg.root_src_path.len);
 }
@@ -2888,7 +2920,7 @@ fn pwriteDbgLineNops(
     prev_padding_size: usize,
     buf: []const u8,
     next_padding_size: usize,
-    offset: usize,
+    offset: u64,
 ) !void {
     const tracy = trace(@src());
     defer tracy.end();
@@ -2967,7 +2999,7 @@ fn pwriteDbgInfoNops(
     buf: []const u8,
     next_padding_size: usize,
     trailing_zero: bool,
-    offset: usize,
+    offset: u64,
 ) !void {
     const tracy = trace(@src());
     defer tracy.end();

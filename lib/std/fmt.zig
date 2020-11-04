@@ -64,7 +64,11 @@ fn peekIsAlign(comptime fmt: []const u8) bool {
 /// - `x` and `X`:
 ///   - format the non-numeric value as a string of bytes in hexadecimal notation ("binary dump") in either lower case or upper case
 ///   - output numeric value in hexadecimal notation
-/// - `s`: print a pointer-to-many as a c-string, use zero-termination
+/// - `s`:
+///   - for pointer-to-many and C pointers of u8, print as a C-string using zero-termination
+///   - for slices of u8, print the entire slice as a string without zero-termination
+/// - `z`: escape the string with @"" syntax if it is not a valid Zig identifier.
+/// - `Z`: print the string escaping non-printable characters using Zig escape sequences.
 /// - `B` and `Bi`: output a memory size in either metric (1000) or power-of-two (1024) based notation. works for both float and integer values.
 /// - `e` and `E`: if printing a string, escape non-printable characters
 /// - `e`: output floating point value in scientific notation
@@ -494,6 +498,7 @@ pub fn formatType(
             const buffer = [_]u8{'.'} ++ @tagName(value);
             return formatType(buffer, fmt, options, writer, max_depth);
         },
+        .Null => return formatBuf("null", options, writer),
         else => @compileError("Unable to format type '" ++ @typeName(T) ++ "'"),
     }
 }
@@ -542,6 +547,13 @@ pub fn formatIntValue(
             return formatAsciiChar(@as(u8, int_value), options, writer);
         } else {
             @compileError("Cannot print integer that is larger than 8 bits as a ascii");
+        }
+    } else if (comptime std.mem.eql(u8, fmt, "Z")) {
+        if (@typeInfo(@TypeOf(int_value)).Int.bits <= 8) {
+            const c: u8 = int_value;
+            return formatZigEscapes(@as(*const [1]u8, &c), options, writer);
+        } else {
+            @compileError("Cannot escape character with more than 8 bits");
         }
     } else if (comptime std.mem.eql(u8, fmt, "b")) {
         radix = 2;
@@ -612,6 +624,10 @@ pub fn formatText(
             }
         }
         return;
+    } else if (comptime std.mem.eql(u8, fmt, "z")) {
+        return formatZigIdentifier(bytes, options, writer);
+    } else if (comptime std.mem.eql(u8, fmt, "Z")) {
+        return formatZigEscapes(bytes, options, writer);
     } else {
         @compileError("Unknown format string: '" ++ fmt ++ "'");
     }
@@ -652,9 +668,55 @@ pub fn formatBuf(
     }
 }
 
-// Print a float in scientific notation to the specified precision. Null uses full precision.
-// It should be the case that every full precision, printed value can be re-parsed back to the
-// same type unambiguously.
+/// Print the string as a Zig identifier escaping it with @"" syntax if needed.
+pub fn formatZigIdentifier(
+    bytes: []const u8,
+    options: FormatOptions,
+    writer: anytype,
+) !void {
+    if (isValidZigIdentifier(bytes)) {
+        return writer.writeAll(bytes);
+    }
+    try writer.writeAll("@\"");
+    try formatZigEscapes(bytes, options, writer);
+    try writer.writeByte('"');
+}
+
+fn isValidZigIdentifier(bytes: []const u8) bool {
+    for (bytes) |c, i| {
+        switch (c) {
+            '_', 'a'...'z', 'A'...'Z' => {},
+            '0'...'9' => if (i == 0) return false,
+            else => return false,
+        }
+    }
+    return std.zig.Token.getKeyword(bytes) == null;
+}
+
+pub fn formatZigEscapes(
+    bytes: []const u8,
+    options: FormatOptions,
+    writer: anytype,
+) !void {
+    for (bytes) |byte| switch (byte) {
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        '\\' => try writer.writeAll("\\\\"),
+        '"' => try writer.writeAll("\\\""),
+        '\'' => try writer.writeAll("\\'"),
+        ' ', '!', '#'...'&', '('...'[', ']'...'~' => try writer.writeByte(byte),
+        // Use hex escapes for rest any unprintable characters.
+        else => {
+            try writer.writeAll("\\x");
+            try formatInt(byte, 16, false, .{ .width = 2, .fill = '0' }, writer);
+        },
+    };
+}
+
+/// Print a float in scientific notation to the specified precision. Null uses full precision.
+/// It should be the case that every full precision, printed value can be re-parsed back to the
+/// same type unambiguously.
 pub fn formatFloatScientific(
     value: anytype,
     options: FormatOptions,
@@ -746,8 +808,8 @@ pub fn formatFloatScientific(
     }
 }
 
-// Print a float of the format x.yyyyy where the number of y is specified by the precision argument.
-// By default floats are printed at full precision (no rounding).
+/// Print a float of the format x.yyyyy where the number of y is specified by the precision argument.
+/// By default floats are printed at full precision (no rounding).
 pub fn formatFloatDecimal(
     value: anytype,
     options: FormatOptions,
@@ -950,7 +1012,7 @@ pub fn formatInt(
     // The type must have the same size as `base` or be wider in order for the
     // division to work
     const min_int_bits = comptime math.max(value_info.bits, 8);
-    const MinInt = std.meta.Int(false, min_int_bits);
+    const MinInt = std.meta.Int(.unsigned, min_int_bits);
 
     const abs_value = math.absCast(int_value);
     // The worst case in terms of space needed is base 2, plus 1 for the sign
@@ -997,6 +1059,16 @@ pub const ParseIntError = error{
     InvalidCharacter,
 };
 
+/// Parses the string `buf` as signed or unsigned representation in the
+/// specified radix of an integral value of type `T`.
+///
+/// When `radix` is zero the string prefix is examined to detect the true radix:
+///  * A prefix of "0b" implies radix=2,
+///  * A prefix of "0o" implies radix=8,
+///  * A prefix of "0x" implies radix=16,
+///  * Otherwise radix=10 is assumed.
+///
+/// See also `parseUnsigned`.
 pub fn parseInt(comptime T: type, buf: []const u8, radix: u8) ParseIntError!T {
     if (buf.len == 0) return error.InvalidCharacter;
     if (buf[0] == '+') return parseWithSign(T, buf[1..], radix, .Pos);
@@ -1029,6 +1101,20 @@ test "parseInt" {
     std.testing.expectError(error.InvalidCharacter, parseInt(i32, "+", 10));
     std.testing.expectError(error.InvalidCharacter, parseInt(u32, "-", 10));
     std.testing.expectError(error.InvalidCharacter, parseInt(i32, "-", 10));
+
+    // autodectect the radix
+    std.testing.expect((try parseInt(i32, "111", 0)) == 111);
+    std.testing.expect((try parseInt(i32, "+0b111", 0)) == 7);
+    std.testing.expect((try parseInt(i32, "+0o111", 0)) == 73);
+    std.testing.expect((try parseInt(i32, "+0x111", 0)) == 273);
+    std.testing.expect((try parseInt(i32, "-0b111", 0)) == -7);
+    std.testing.expect((try parseInt(i32, "-0o111", 0)) == -73);
+    std.testing.expect((try parseInt(i32, "-0x111", 0)) == -273);
+
+    // bare binary/octal/decimal prefix is invalid
+    std.testing.expectError(error.InvalidCharacter, parseInt(u32, "0b", 0));
+    std.testing.expectError(error.InvalidCharacter, parseInt(u32, "0o", 0));
+    std.testing.expectError(error.InvalidCharacter, parseInt(u32, "0x", 0));
 }
 
 fn parseWithSign(
@@ -1039,6 +1125,31 @@ fn parseWithSign(
 ) ParseIntError!T {
     if (buf.len == 0) return error.InvalidCharacter;
 
+    var buf_radix = radix;
+    var buf_start = buf;
+    if (radix == 0) {
+        // Treat is as a decimal number by default.
+        buf_radix = 10;
+        // Detect the radix by looking at buf prefix.
+        if (buf.len > 2 and buf[0] == '0') {
+            switch (buf[1]) {
+                'b' => {
+                    buf_radix = 2;
+                    buf_start = buf[2..];
+                },
+                'o' => {
+                    buf_radix = 8;
+                    buf_start = buf[2..];
+                },
+                'x' => {
+                    buf_radix = 16;
+                    buf_start = buf[2..];
+                },
+                else => {},
+            }
+        }
+    }
+
     const add = switch (sign) {
         .Pos => math.add,
         .Neg => math.sub,
@@ -1046,16 +1157,26 @@ fn parseWithSign(
 
     var x: T = 0;
 
-    for (buf) |c| {
-        const digit = try charToDigit(c, radix);
+    for (buf_start) |c| {
+        const digit = try charToDigit(c, buf_radix);
 
-        if (x != 0) x = try math.mul(T, x, try math.cast(T, radix));
+        if (x != 0) x = try math.mul(T, x, try math.cast(T, buf_radix));
         x = try add(T, x, try math.cast(T, digit));
     }
 
     return x;
 }
 
+/// Parses the string `buf` as  unsigned representation in the specified radix
+/// of an integral value of type `T`.
+///
+/// When `radix` is zero the string prefix is examined to detect the true radix:
+///  * A prefix of "0b" implies radix=2,
+///  * A prefix of "0o" implies radix=8,
+///  * A prefix of "0x" implies radix=16,
+///  * Otherwise radix=10 is assumed.
+///
+/// See also `parseInt`.
 pub fn parseUnsigned(comptime T: type, buf: []const u8, radix: u8) ParseIntError!T {
     return parseWithSign(T, buf, radix, .Pos);
 }
@@ -1131,7 +1252,12 @@ pub fn bufPrint(buf: []u8, comptime fmt: []const u8, args: anytype) BufPrintErro
     return fbs.getWritten();
 }
 
-// Count the characters needed for format. Useful for preallocating memory
+pub fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) BufPrintError![:0]u8 {
+    const result = try bufPrint(buf, fmt ++ "\x00", args);
+    return result[0 .. result.len - 1 :0];
+}
+
+/// Count the characters needed for format. Useful for preallocating memory
 pub fn count(comptime fmt: []const u8, args: anytype) u64 {
     var counting_writer = std.io.countingWriter(std.io.null_writer);
     format(counting_writer.writer(), fmt, args) catch |err| switch (err) {};
@@ -1151,7 +1277,10 @@ pub fn allocPrint(allocator: *mem.Allocator, comptime fmt: []const u8, args: any
     };
 }
 
-pub fn allocPrint0(allocator: *mem.Allocator, comptime fmt: []const u8, args: anytype) AllocPrintError![:0]u8 {
+/// Deprecated, use allocPrintZ
+pub const allocPrint0 = allocPrintZ;
+
+pub fn allocPrintZ(allocator: *mem.Allocator, comptime fmt: []const u8, args: anytype) AllocPrintError![:0]u8 {
     const result = try allocPrint(allocator, fmt ++ "\x00", args);
     return result[0 .. result.len - 1 :0];
 }
@@ -1177,8 +1306,23 @@ test "bufPrintInt" {
     std.testing.expectEqualSlices(u8, "-42", bufPrintIntToSlice(buf, @as(i32, -42), 10, false, FormatOptions{ .width = 3 }));
 }
 
-fn bufPrintIntToSlice(buf: []u8, value: anytype, base: u8, uppercase: bool, options: FormatOptions) []u8 {
+pub fn bufPrintIntToSlice(buf: []u8, value: anytype, base: u8, uppercase: bool, options: FormatOptions) []u8 {
     return buf[0..formatIntBuf(buf, value, base, uppercase, options)];
+}
+
+pub fn comptimePrint(comptime fmt: []const u8, args: anytype) *const [count(fmt, args):0]u8 {
+    comptime {
+        var buf: [count(fmt, args):0]u8 = undefined;
+        _ = bufPrint(&buf, fmt, args) catch unreachable;
+        buf[buf.len] = 0;
+        return &buf;
+    }
+}
+
+test "comptimePrint" {
+    @setEvalBranchQuota(2000);
+    std.testing.expectEqual(*const [3:0]u8, @TypeOf(comptime comptimePrint("{}", .{100})));
+    std.testing.expectEqualSlices(u8, "100", comptime comptimePrint("{}", .{100}));
 }
 
 test "parse u64 digit too big" {
@@ -1300,6 +1444,10 @@ test "slice" {
         const value = @intToPtr([*]align(1) const []const u8, 0xdeadbeef)[runtime_zero..runtime_zero];
         try testFmt("slice: []const u8@deadbeef\n", "slice: {}\n", .{value});
     }
+    {
+        const null_term_slice: [:0]const u8 = "\x00hello\x00";
+        try testFmt("buf: \x00hello\x00\n", "buf: {s}\n", .{null_term_slice});
+    }
 
     try testFmt("buf:  Test\n", "buf: {s:5}\n", .{"Test"});
     try testFmt("buf: Test\n Other text", "buf: {s}\n Other text", .{"Test"});
@@ -1309,6 +1457,17 @@ test "escape non-printable" {
     try testFmt("abc", "{e}", .{"abc"});
     try testFmt("ab\\xffc", "{e}", .{"ab\xffc"});
     try testFmt("ab\\xFFc", "{E}", .{"ab\xffc"});
+}
+
+test "escape invalid identifiers" {
+    try testFmt("@\"while\"", "{z}", .{"while"});
+    try testFmt("hello", "{z}", .{"hello"});
+    try testFmt("@\"11\\\"23\"", "{z}", .{"11\"23"});
+    try testFmt("@\"11\\x0f23\"", "{z}", .{"11\x0F23"});
+    try testFmt("\\x0f", "{Z}", .{0x0f});
+    try testFmt(
+        \\" \\ hi \x07 \x11 \" derp \'"
+    , "\"{Z}\"", .{" \\ hi \x07 \x11 \" derp '"});
 }
 
 test "pointer" {
@@ -1603,38 +1762,8 @@ fn testFmt(expected: []const u8, comptime template: []const u8, args: anytype) !
     return error.TestFailed;
 }
 
-pub fn trim(buf: []const u8) []const u8 {
-    var start: usize = 0;
-    while (start < buf.len and isWhiteSpace(buf[start])) : (start += 1) {}
-
-    var end: usize = buf.len;
-    while (true) {
-        if (end > start) {
-            const new_end = end - 1;
-            if (isWhiteSpace(buf[new_end])) {
-                end = new_end;
-                continue;
-            }
-        }
-        break;
-    }
-    return buf[start..end];
-}
-
-test "trim" {
-    std.testing.expect(mem.eql(u8, "abc", trim("\n  abc  \t")));
-    std.testing.expect(mem.eql(u8, "", trim("   ")));
-    std.testing.expect(mem.eql(u8, "", trim("")));
-    std.testing.expect(mem.eql(u8, "abc", trim(" abc")));
-    std.testing.expect(mem.eql(u8, "abc", trim("abc ")));
-}
-
-pub fn isWhiteSpace(byte: u8) bool {
-    return switch (byte) {
-        ' ', '\t', '\n', '\r' => true,
-        else => false,
-    };
-}
+pub const trim = @compileError("deprecated; use std.mem.trim with std.ascii.spaces instead");
+pub const isWhiteSpace = @compileError("deprecated; use std.ascii.isSpace instead");
 
 pub fn hexToBytes(out: []u8, input: []const u8) !void {
     if (out.len * 2 < input.len)
@@ -1814,4 +1943,9 @@ test "sci float padding" {
     try testFmt("left-pad:   **3.141e+00\n", "left-pad:   {e:*>11.3}\n", .{number});
     try testFmt("center-pad: *3.141e+00*\n", "center-pad: {e:*^11.3}\n", .{number});
     try testFmt("right-pad:  3.141e+00**\n", "right-pad:  {e:*<11.3}\n", .{number});
+}
+
+test "null" {
+    const inst = null;
+    try testFmt("null", "{}", .{inst});
 }

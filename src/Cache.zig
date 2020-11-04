@@ -35,7 +35,7 @@ const manifest_file_size_max = 50 * 1024 * 1024;
 pub const Hasher = crypto.auth.siphash.SipHash128(1, 3);
 
 /// Initial state, that can be copied.
-pub const hasher_init: Hasher = Hasher.init(&[_]u8{0} ** Hasher.minimum_key_length);
+pub const hasher_init: Hasher = Hasher.init(&[_]u8{0} ** Hasher.key_length);
 
 pub const File = struct {
     path: ?[]const u8,
@@ -315,8 +315,9 @@ pub const Manifest = struct {
                 cache_hash_file.path = try self.cache.gpa.dupe(u8, file_path);
             }
 
-            const this_file = fs.cwd().openFile(cache_hash_file.path.?, .{ .read = true }) catch {
-                return error.CacheUnavailable;
+            const this_file = fs.cwd().openFile(cache_hash_file.path.?, .{ .read = true }) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                else => return error.CacheUnavailable,
             };
             defer this_file.close();
 
@@ -576,7 +577,31 @@ pub const Manifest = struct {
     }
 };
 
-fn hashFile(file: fs.File, bin_digest: []u8) !void {
+/// On operating systems that support symlinks, does a readlink. On other operating systems,
+/// uses the file contents. Windows supports symlinks but only with elevated privileges, so
+/// it is treated as not supporting symlinks.
+pub fn readSmallFile(dir: fs.Dir, sub_path: []const u8, buffer: []u8) ![]u8 {
+    if (std.Target.current.os.tag == .windows) {
+        return dir.readFile(sub_path, buffer);
+    } else {
+        return dir.readLink(sub_path, buffer);
+    }
+}
+
+/// On operating systems that support symlinks, does a symlink. On other operating systems,
+/// uses the file contents. Windows supports symlinks but only with elevated privileges, so
+/// it is treated as not supporting symlinks.
+/// `data` must be a valid UTF-8 encoded file path and 255 bytes or fewer.
+pub fn writeSmallFile(dir: fs.Dir, sub_path: []const u8, data: []const u8) !void {
+    assert(data.len <= 255);
+    if (std.Target.current.os.tag == .windows) {
+        return dir.writeFile(sub_path, data);
+    } else {
+        return dir.symLink(data, sub_path, .{});
+    }
+}
+
+fn hashFile(file: fs.File, bin_digest: *[Hasher.mac_length]u8) !void {
     var buf: [1024]u8 = undefined;
 
     var hasher = hasher_init;

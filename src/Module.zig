@@ -70,6 +70,9 @@ deletion_set: ArrayListUnmanaged(*Decl) = .{},
 /// Error tags and their values, tag names are duped with mod.gpa.
 global_error_set: std.StringHashMapUnmanaged(u16) = .{},
 
+/// Keys are fully qualified paths
+import_table: std.StringArrayHashMapUnmanaged(*Scope.File) = .{},
+
 /// Incrementing integer used to compare against the corresponding Decl
 /// field to determine whether a Decl's status applies to an ongoing update, or a
 /// previous analysis.
@@ -90,7 +93,7 @@ pub const Export = struct {
     /// Byte offset into the file that contains the export directive.
     src: usize,
     /// Represents the position of the export, if any, in the output file.
-    link: link.File.Elf.Export,
+    link: link.File.Export,
     /// The Decl that performs the export. Note that this is *not* the Decl being exported.
     owner_decl: *Decl,
     /// The Decl being exported. Note this is *not* the Decl performing the export.
@@ -208,7 +211,7 @@ pub const Decl = struct {
             .container => {
                 const container = @fieldParentPtr(Scope.Container, "base", self.scope);
                 const tree = container.file_scope.contents.tree;
-                // TODO Container should have it's own decls()
+                // TODO Container should have its own decls()
                 const decl_node = tree.root_node.decls()[self.src_index];
                 return tree.token_locs[decl_node.firstToken()].start;
             },
@@ -466,6 +469,22 @@ pub const Scope = struct {
         }
     }
 
+    pub fn getOwnerPkg(base: *Scope) *Package {
+        var cur = base;
+        while (true) {
+            cur = switch (cur.tag) {
+                .container => return @fieldParentPtr(Container, "base", cur).file_scope.pkg,
+                .file => return @fieldParentPtr(File, "base", cur).pkg,
+                .zir_module => unreachable, // TODO are zir modules allowed to import packages?
+                .gen_zir => @fieldParentPtr(GenZIR, "base", cur).parent,
+                .local_val => @fieldParentPtr(LocalVal, "base", cur).parent,
+                .local_ptr => @fieldParentPtr(LocalPtr, "base", cur).parent,
+                .block => @fieldParentPtr(Block, "base", cur).decl.scope,
+                .decl => @fieldParentPtr(DeclAnalysis, "base", cur).decl.scope,
+            };
+        }
+    }
+
     /// Asserts the scope is a namespace Scope and removes the Decl from the namespace.
     pub fn removeDecl(base: *Scope, child: *Decl) void {
         switch (base.tag) {
@@ -532,12 +551,13 @@ pub const Scope = struct {
 
         /// Direct children of the file.
         decls: std.AutoArrayHashMapUnmanaged(*Decl, void),
-
-        // TODO implement container types and put this in a status union
-        // ty: Type
+        ty: Type,
 
         pub fn deinit(self: *Container, gpa: *Allocator) void {
             self.decls.deinit(gpa);
+            // TODO either Container of File should have an arena for sub_file_path and ty
+            gpa.destroy(self.ty.cast(Type.Payload.EmptyStruct).?);
+            gpa.free(self.file_scope.sub_file_path);
             self.* = undefined;
         }
 
@@ -572,6 +592,8 @@ pub const Scope = struct {
             unloaded_parse_failure,
             loaded_success,
         },
+        /// Package that this file is a part of, managed externally.
+        pkg: *Package,
 
         root_container: Container,
 
@@ -610,7 +632,7 @@ pub const Scope = struct {
         pub fn getSource(self: *File, module: *Module) ![:0]const u8 {
             switch (self.source) {
                 .unloaded => {
-                    const source = try module.root_pkg.root_src_directory.handle.readFileAllocOptions(
+                    const source = try self.pkg.root_src_directory.handle.readFileAllocOptions(
                         module.gpa,
                         self.sub_file_path,
                         std.math.maxInt(u32),
@@ -854,6 +876,11 @@ pub fn deinit(self: *Module) void {
         gpa.free(entry.key);
     }
     self.global_error_set.deinit(gpa);
+
+    for (self.import_table.items()) |entry| {
+        entry.value.base.destroy(gpa);
+    }
+    self.import_table.deinit(gpa);
 }
 
 fn freeExportList(gpa: *Allocator, export_list: []*Export) void {
@@ -1027,6 +1054,10 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 .param_types = param_types,
             }, .{});
 
+            if (self.comp.verbose_ir) {
+                zir.dumpZir(self.gpa, "fn_type", decl.name, fn_type_scope.instructions.items) catch {};
+            }
+
             // We need the memory for the Type to go into the arena for the Decl
             var decl_arena = std.heap.ArenaAllocator.init(self.gpa);
             errdefer decl_arena.deinit();
@@ -1098,6 +1129,10 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 {
                     const src = tree.token_locs[body_block.rbrace].start;
                     _ = try astgen.addZIRNoOp(self, &gen_scope.base, src, .returnvoid);
+                }
+
+                if (self.comp.verbose_ir) {
+                    zir.dumpZir(self.gpa, "fn_body", decl.name, gen_scope.instructions.items) catch {};
                 }
 
                 const fn_zir = try gen_scope_arena.allocator.create(Fn.ZIR);
@@ -1231,6 +1266,9 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
 
                 const src = tree.token_locs[init_node.firstToken()].start;
                 const init_inst = try astgen.expr(self, &gen_scope.base, init_result_loc, init_node);
+                if (self.comp.verbose_ir) {
+                    zir.dumpZir(self.gpa, "var_init", decl.name, gen_scope.instructions.items) catch {};
+                }
 
                 var inner_block: Scope.Block = .{
                     .parent = null,
@@ -1272,6 +1310,10 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                     .val = Value.initTag(.type_type),
                 });
                 const var_type = try astgen.expr(self, &type_scope.base, .{ .ty = type_type }, type_node);
+                if (self.comp.verbose_ir) {
+                    zir.dumpZir(self.gpa, "var_type", decl.name, type_scope.instructions.items) catch {};
+                }
+
                 const ty = try zir_sema.analyzeBodyValueAsType(self, &block_scope, var_type, .{
                     .instructions = type_scope.instructions.items,
                 });
@@ -1345,6 +1387,9 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             defer gen_scope.instructions.deinit(self.gpa);
 
             _ = try astgen.comptimeExpr(self, &gen_scope.base, .none, comptime_decl.expr);
+            if (self.comp.verbose_ir) {
+                zir.dumpZir(self.gpa, "comptime_block", decl.name, gen_scope.instructions.items) catch {};
+            }
 
             var block_scope: Scope.Block = .{
                 .parent = null,
@@ -1703,7 +1748,10 @@ fn deleteDeclExports(self: *Module, decl: *Decl) void {
             }
         }
         if (self.comp.bin_file.cast(link.File.Elf)) |elf| {
-            elf.deleteExport(exp.link);
+            elf.deleteExport(exp.link.elf);
+        }
+        if (self.comp.bin_file.cast(link.File.MachO)) |macho| {
+            macho.deleteExport(exp.link.macho);
         }
         if (self.failed_exports.remove(exp)) |entry| {
             entry.value.destroy(self.gpa);
@@ -1866,7 +1914,13 @@ pub fn analyzeExport(self: *Module, scope: *Scope, src: usize, borrowed_symbol_n
     new_export.* = .{
         .options = .{ .name = symbol_name },
         .src = src,
-        .link = .{},
+        .link = switch (self.comp.bin_file.tag) {
+            .coff => .{ .coff = {} },
+            .elf => .{ .elf = link.File.Elf.Export{} },
+            .macho => .{ .macho = link.File.MachO.Export{} },
+            .c => .{ .c = {} },
+            .wasm => .{ .wasm = {} },
+        },
         .owner_decl = owner_decl,
         .exported_decl = exported_decl,
         .status = .in_progress,
@@ -2057,6 +2111,29 @@ pub fn addCall(
         },
         .func = func,
         .args = args,
+    };
+    try block.instructions.append(self.gpa, &inst.base);
+    return &inst.base;
+}
+
+pub fn addSwitchBr(
+    self: *Module,
+    block: *Scope.Block,
+    src: usize,
+    target_ptr: *Inst,
+    cases: []Inst.SwitchBr.Case,
+    else_body: ir.Body,
+) !*Inst {
+    const inst = try block.arena.create(Inst.SwitchBr);
+    inst.* = .{
+        .base = .{
+            .tag = .switchbr,
+            .ty = Type.initTag(.noreturn),
+            .src = src,
+        },
+        .target_ptr = target_ptr,
+        .cases = cases,
+        .else_body = else_body,
     };
     try block.instructions.append(self.gpa, &inst.base);
     return &inst.base;
@@ -2381,6 +2458,60 @@ pub fn analyzeSlice(self: *Module, scope: *Scope, src: usize, array_ptr: *Inst, 
     return self.fail(scope, src, "TODO implement analysis of slice", .{});
 }
 
+pub fn analyzeImport(self: *Module, scope: *Scope, src: usize, target_string: []const u8) !*Scope.File {
+    const cur_pkg = scope.getOwnerPkg();
+    const cur_pkg_dir_path = cur_pkg.root_src_directory.path orelse ".";
+    const found_pkg = cur_pkg.table.get(target_string);
+
+    const resolved_path = if (found_pkg) |pkg|
+        try std.fs.path.resolve(self.gpa, &[_][]const u8{ pkg.root_src_directory.path orelse ".", pkg.root_src_path })
+    else
+        try std.fs.path.resolve(self.gpa, &[_][]const u8{ cur_pkg_dir_path, target_string });
+    errdefer self.gpa.free(resolved_path);
+
+    if (self.import_table.get(resolved_path)) |some| {
+        self.gpa.free(resolved_path);
+        return some;
+    }
+
+    if (found_pkg == null) {
+        const resolved_root_path = try std.fs.path.resolve(self.gpa, &[_][]const u8{cur_pkg_dir_path});
+        defer self.gpa.free(resolved_root_path);
+
+        if (!mem.startsWith(u8, resolved_path, resolved_root_path)) {
+            return error.ImportOutsidePkgPath;
+        }
+    }
+
+    // TODO Scope.Container arena for ty and sub_file_path
+    const struct_payload = try self.gpa.create(Type.Payload.EmptyStruct);
+    errdefer self.gpa.destroy(struct_payload);
+    const file_scope = try self.gpa.create(Scope.File);
+    errdefer self.gpa.destroy(file_scope);
+
+    struct_payload.* = .{ .scope = &file_scope.root_container };
+    file_scope.* = .{
+        .sub_file_path = resolved_path,
+        .source = .{ .unloaded = {} },
+        .contents = .{ .not_available = {} },
+        .status = .never_loaded,
+        .pkg = found_pkg orelse cur_pkg,
+        .root_container = .{
+            .file_scope = file_scope,
+            .decls = .{},
+            .ty = Type.initPayload(&struct_payload.base),
+        },
+    };
+    self.analyzeContainer(&file_scope.root_container) catch |err| switch (err) {
+        error.AnalysisFail => {
+            assert(self.comp.totalErrorCount() != 0);
+        },
+        else => |e| return e,
+    };
+    try self.import_table.put(self.gpa, file_scope.sub_file_path, file_scope);
+    return file_scope;
+}
+
 /// Asserts that lhs and rhs types are both numeric.
 pub fn cmpNumeric(
     self: *Module,
@@ -2581,43 +2712,52 @@ pub fn resolvePeerTypes(self: *Module, scope: *Scope, instructions: []*Inst) !Ty
     if (instructions.len == 1)
         return instructions[0].ty;
 
-    var prev_inst = instructions[0];
-    for (instructions[1..]) |next_inst| {
-        if (next_inst.ty.eql(prev_inst.ty))
+    var chosen = instructions[0];
+    for (instructions[1..]) |candidate| {
+        if (candidate.ty.eql(chosen.ty))
             continue;
-        if (next_inst.ty.zigTypeTag() == .NoReturn)
+        if (candidate.ty.zigTypeTag() == .NoReturn)
             continue;
-        if (prev_inst.ty.zigTypeTag() == .NoReturn) {
-            prev_inst = next_inst;
-            continue;
-        }
-        if (next_inst.ty.zigTypeTag() == .Undefined)
-            continue;
-        if (prev_inst.ty.zigTypeTag() == .Undefined) {
-            prev_inst = next_inst;
+        if (chosen.ty.zigTypeTag() == .NoReturn) {
+            chosen = candidate;
             continue;
         }
-        if (prev_inst.ty.isInt() and
-            next_inst.ty.isInt() and
-            prev_inst.ty.isSignedInt() == next_inst.ty.isSignedInt())
+        if (candidate.ty.zigTypeTag() == .Undefined)
+            continue;
+        if (chosen.ty.zigTypeTag() == .Undefined) {
+            chosen = candidate;
+            continue;
+        }
+        if (chosen.ty.isInt() and
+            candidate.ty.isInt() and
+            chosen.ty.isSignedInt() == candidate.ty.isSignedInt())
         {
-            if (prev_inst.ty.intInfo(self.getTarget()).bits < next_inst.ty.intInfo(self.getTarget()).bits) {
-                prev_inst = next_inst;
+            if (chosen.ty.intInfo(self.getTarget()).bits < candidate.ty.intInfo(self.getTarget()).bits) {
+                chosen = candidate;
             }
             continue;
         }
-        if (prev_inst.ty.isFloat() and next_inst.ty.isFloat()) {
-            if (prev_inst.ty.floatBits(self.getTarget()) < next_inst.ty.floatBits(self.getTarget())) {
-                prev_inst = next_inst;
+        if (chosen.ty.isFloat() and candidate.ty.isFloat()) {
+            if (chosen.ty.floatBits(self.getTarget()) < candidate.ty.floatBits(self.getTarget())) {
+                chosen = candidate;
             }
+            continue;
+        }
+
+        if (chosen.ty.zigTypeTag() == .ComptimeInt and candidate.ty.isInt()) {
+            chosen = candidate;
+            continue;
+        }
+
+        if (chosen.ty.isInt() and candidate.ty.zigTypeTag() == .ComptimeInt) {
             continue;
         }
 
         // TODO error notes pointing out each type
-        return self.fail(scope, next_inst.src, "incompatible types: '{}' and '{}'", .{ prev_inst.ty, next_inst.ty });
+        return self.fail(scope, candidate.src, "incompatible types: '{}' and '{}'", .{ chosen.ty, candidate.ty });
     }
 
-    return prev_inst.ty;
+    return chosen.ty;
 }
 
 pub fn coerce(self: *Module, scope: *Scope, dest_type: Type, inst: *Inst) !*Inst {

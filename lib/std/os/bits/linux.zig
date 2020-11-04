@@ -19,6 +19,7 @@ pub usingnamespace switch (builtin.arch) {
     .aarch64 => @import("linux/arm64.zig"),
     .arm => @import("linux/arm-eabi.zig"),
     .riscv64 => @import("linux/riscv64.zig"),
+    .sparcv9 => @import("linux/sparc64.zig"),
     .mips, .mipsel => @import("linux/mips.zig"),
     .powerpc64, .powerpc64le => @import("linux/powerpc64.zig"),
     else => struct {},
@@ -29,6 +30,8 @@ pub usingnamespace @import("linux/prctl.zig");
 pub usingnamespace @import("linux/securebits.zig");
 
 const is_mips = builtin.arch.isMIPS();
+const is_ppc64 = builtin.arch.isPPC64();
+const is_sparc = builtin.arch.isSPARC();
 
 pub const pid_t = i32;
 pub const fd_t = i32;
@@ -181,27 +184,46 @@ pub usingnamespace if (is_mips)
         pub const SA_NOCLDSTOP = 1;
         pub const SA_NOCLDWAIT = 0x10000;
         pub const SA_SIGINFO = 8;
+        pub const SA_RESTART = 0x10000000;
+        pub const SA_RESETHAND = 0x80000000;
+        pub const SA_ONSTACK = 0x08000000;
+        pub const SA_NODEFER = 0x40000000;
+        pub const SA_RESTORER = 0x04000000;
 
         pub const SIG_BLOCK = 1;
         pub const SIG_UNBLOCK = 2;
         pub const SIG_SETMASK = 3;
+    }
+else if (is_sparc)
+    struct {
+        pub const SA_NOCLDSTOP = 0x8;
+        pub const SA_NOCLDWAIT = 0x100;
+        pub const SA_SIGINFO = 0x200;
+        pub const SA_RESTART = 0x2;
+        pub const SA_RESETHAND = 0x4;
+        pub const SA_ONSTACK = 0x1;
+        pub const SA_NODEFER = 0x20;
+        pub const SA_RESTORER = 0x04000000;
+
+        pub const SIG_BLOCK = 1;
+        pub const SIG_UNBLOCK = 2;
+        pub const SIG_SETMASK = 4;
     }
 else
     struct {
         pub const SA_NOCLDSTOP = 1;
         pub const SA_NOCLDWAIT = 2;
         pub const SA_SIGINFO = 4;
+        pub const SA_RESTART = 0x10000000;
+        pub const SA_RESETHAND = 0x80000000;
+        pub const SA_ONSTACK = 0x08000000;
+        pub const SA_NODEFER = 0x40000000;
+        pub const SA_RESTORER = 0x04000000;
 
         pub const SIG_BLOCK = 0;
         pub const SIG_UNBLOCK = 1;
         pub const SIG_SETMASK = 2;
     };
-
-pub const SA_ONSTACK = 0x08000000;
-pub const SA_RESTART = 0x10000000;
-pub const SA_NODEFER = 0x40000000;
-pub const SA_RESETHAND = 0x80000000;
-pub const SA_RESTORER = 0x04000000;
 
 pub const SIGHUP = 1;
 pub const SIGINT = 2;
@@ -540,8 +562,8 @@ pub const TIOCGPGRP = 0x540F;
 pub const TIOCSPGRP = 0x5410;
 pub const TIOCOUTQ = if (is_mips) 0x7472 else 0x5411;
 pub const TIOCSTI = 0x5412;
-pub const TIOCGWINSZ = if (is_mips) 0x40087468 else 0x5413;
-pub const TIOCSWINSZ = if (is_mips) 0x80087467 else 0x5414;
+pub const TIOCGWINSZ = if (is_mips or is_ppc64) 0x40087468 else 0x5413;
+pub const TIOCSWINSZ = if (is_mips or is_ppc64) 0x80087467 else 0x5414;
 pub const TIOCMGET = 0x5415;
 pub const TIOCMBIS = 0x5416;
 pub const TIOCMBIC = 0x5417;
@@ -1073,7 +1095,7 @@ pub const dl_phdr_info = extern struct {
 
 pub const CPU_SETSIZE = 128;
 pub const cpu_set_t = [CPU_SETSIZE / @sizeOf(usize)]usize;
-pub const cpu_count_t = std.meta.Int(false, std.math.log2(CPU_SETSIZE * 8));
+pub const cpu_count_t = std.meta.Int(.unsigned, std.math.log2(CPU_SETSIZE * 8));
 
 pub fn CPU_COUNT(set: cpu_set_t) cpu_count_t {
     var sum: cpu_count_t = 0;
@@ -1199,6 +1221,8 @@ pub const IORING_FEAT_NODROP = 1 << 1;
 pub const IORING_FEAT_SUBMIT_STABLE = 1 << 2;
 pub const IORING_FEAT_RW_CUR_POS = 1 << 3;
 pub const IORING_FEAT_CUR_PERSONALITY = 1 << 4;
+pub const IORING_FEAT_FAST_POLL = 1 << 5;
+pub const IORING_FEAT_POLL_32BITS = 1 << 6;
 
 // io_uring_params.flags
 
@@ -1251,6 +1275,9 @@ pub const io_sqring_offsets = extern struct {
 /// needs io_uring_enter wakeup
 pub const IORING_SQ_NEED_WAKEUP = 1 << 0;
 
+/// kernel has cqes waiting beyond the cq ring
+pub const IORING_SQ_CQ_OVERFLOW = 1 << 1;
+
 pub const io_cqring_offsets = extern struct {
     head: u32,
     tail: u32,
@@ -1262,48 +1289,19 @@ pub const io_cqring_offsets = extern struct {
 };
 
 pub const io_uring_sqe = extern struct {
-    pub const union1 = extern union {
-        off: u64,
-        addr2: u64,
-    };
-
-    pub const union2 = extern union {
-        rw_flags: kernel_rwf,
-        fsync_flags: u32,
-        poll_events: u16,
-        sync_range_flags: u32,
-        msg_flags: u32,
-        timeout_flags: u32,
-        accept_flags: u32,
-        cancel_flags: u32,
-        open_flags: u32,
-        statx_flags: u32,
-        fadvise_flags: u32,
-    };
-
-    pub const union3 = extern union {
-        struct1: extern struct {
-            /// index into fixed buffers, if used
-            buf_index: u16,
-
-            /// personality to use, if used
-            personality: u16,
-        },
-        __pad2: [3]u64,
-    };
     opcode: IORING_OP,
     flags: u8,
     ioprio: u16,
     fd: i32,
-
-    union1: union1,
+    off: u64,
     addr: u64,
     len: u32,
-
-    union2: union2,
+    rw_flags: u32,
     user_data: u64,
-
-    union3: union3,
+    buf_index: u16,
+    personality: u16,
+    splice_fd_in: i32,
+    __pad2: [2]u64
 };
 
 pub const IOSQE_BIT = extern enum(u8) {
@@ -1312,7 +1310,8 @@ pub const IOSQE_BIT = extern enum(u8) {
     IO_LINK,
     IO_HARDLINK,
     ASYNC,
-
+    BUFFER_SELECT,
+    
     _,
 };
 
@@ -1331,7 +1330,10 @@ pub const IOSQE_IO_LINK = 1 << @enumToInt(IOSQE_BIT.IO_LINK);
 pub const IOSQE_IO_HARDLINK = 1 << @enumToInt(IOSQE_BIT.IO_HARDLINK);
 
 /// always go async
-pub const IOSQE_ASYNC = 1 << IOSQE_BIT.ASYNC;
+pub const IOSQE_ASYNC = 1 << @enumToInt(IOSQE_BIT.ASYNC);
+
+/// select buffer from buf_group
+pub const IOSQE_BUFFER_SELECT = 1 << @enumToInt(IOSQE_BIT.BUFFER_SELECT);
 
 pub const IORING_OP = extern enum(u8) {
     NOP,
@@ -1364,6 +1366,10 @@ pub const IORING_OP = extern enum(u8) {
     RECV,
     OPENAT2,
     EPOLL_CTL,
+    SPLICE,
+    PROVIDE_BUFFERS,
+    REMOVE_BUFFERS,
+    TEE,
 
     _,
 };
@@ -1769,7 +1775,7 @@ pub const rusage = extern struct {
     utime: timeval,
     stime: timeval,
     maxrss: isize,
-    ix_rss: isize,
+    ixrss: isize,
     idrss: isize,
     isrss: isize,
     minflt: isize,
@@ -1889,4 +1895,80 @@ pub const ifreq = extern struct {
         newname: [IFNAMESIZE - 1:0]u8,
         data: ?[*]u8,
     },
+};
+
+// doc comments copied from musl
+pub const rlimit_resource = extern enum(c_int) {
+    /// Per-process CPU limit, in seconds.
+    CPU,
+
+    /// Largest file that can be created, in bytes.
+    FSIZE,
+
+    /// Maximum size of data segment, in bytes.
+    DATA,
+
+    /// Maximum size of stack segment, in bytes.
+    STACK,
+
+    /// Largest core file that can be created, in bytes.
+    CORE,
+
+    /// Largest resident set size, in bytes.
+    /// This affects swapping; processes that are exceeding their
+    /// resident set size will be more likely to have physical memory
+    /// taken from them.
+    RSS,
+
+    /// Number of processes.
+    NPROC,
+
+    /// Number of open files.
+    NOFILE,
+
+    /// Locked-in-memory address space.
+    MEMLOCK,
+
+    /// Address space limit.
+    AS,
+
+    /// Maximum number of file locks.
+    LOCKS,
+
+    /// Maximum number of pending signals.
+    SIGPENDING,
+
+    /// Maximum bytes in POSIX message queues.
+    MSGQUEUE,
+
+    /// Maximum nice priority allowed to raise to.
+    /// Nice levels 19 .. -20 correspond to 0 .. 39
+    /// values of this resource limit.
+    NICE,
+
+    /// Maximum realtime priority allowed for non-priviledged
+    /// processes.
+    RTPRIO,
+
+    /// Maximum CPU time in µs that a process scheduled under a real-time
+    /// scheduling policy may consume without making a blocking system
+    /// call before being forcibly descheduled.
+    RTTIME,
+
+    _,
+};
+
+pub const rlim_t = u64;
+
+/// No limit
+pub const RLIM_INFINITY = ~@as(rlim_t, 0);
+
+pub const RLIM_SAVED_MAX = RLIM_INFINITY;
+pub const RLIM_SAVED_CUR = RLIM_INFINITY;
+
+pub const rlimit = extern struct {
+    /// Soft limit
+    cur: rlim_t,
+    /// Hard limit
+    max: rlim_t,
 };

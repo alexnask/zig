@@ -28,9 +28,9 @@ pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
 pub const max_src_size = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 pub const Color = enum {
-    Auto,
-    Off,
-    On,
+    auto,
+    off,
+    on,
 };
 
 const usage =
@@ -114,10 +114,43 @@ pub fn main() anyerror!void {
     return mainArgs(gpa, arena, args);
 }
 
+const os_can_execve = std.builtin.os.tag != .windows;
+
 pub fn mainArgs(gpa: *Allocator, arena: *Allocator, args: []const []const u8) !void {
     if (args.len <= 1) {
         std.log.info("{}", .{usage});
         fatal("expected command argument", .{});
+    }
+
+    if (os_can_execve and std.os.getenvZ("ZIG_IS_DETECTING_LIBC_PATHS") != null) {
+        // In this case we have accidentally invoked ourselves as "the system C compiler"
+        // to figure out where libc is installed. This is essentially infinite recursion
+        // via child process execution due to the CC environment variable pointing to Zig.
+        // Here we ignore the CC environment variable and exec `cc` as a child process.
+        // However it's possible Zig is installed as *that* C compiler as well, which is
+        // why we have this additional environment variable here to check.
+        var env_map = try std.process.getEnvMap(arena);
+
+        const inf_loop_env_key = "ZIG_IS_TRYING_TO_NOT_CALL_ITSELF";
+        if (env_map.get(inf_loop_env_key) != null) {
+            fatal("The compilation links against libc, but Zig is unable to provide a libc " ++
+                "for this operating system, and no --libc " ++
+                "parameter was provided, so Zig attempted to invoke the system C compiler " ++
+                "in order to determine where libc is installed. However the system C " ++
+                "compiler is `zig cc`, so no libc installation was found.", .{});
+        }
+        try env_map.set(inf_loop_env_key, "1");
+
+        // Some programs such as CMake will strip the `cc` and subsequent args from the
+        // CC environment variable. We detect and support this scenario here because of
+        // the ZIG_IS_DETECTING_LIBC_PATHS environment variable.
+        if (mem.eql(u8, args[1], "cc")) {
+            return std.os.execvpe(arena, args[1..], &env_map);
+        } else {
+            const modified_args = try arena.dupe([]const u8, args);
+            modified_args[0] = "cc";
+            return std.os.execvpe(arena, modified_args, &env_map);
+        }
     }
 
     const cmd = args[1];
@@ -188,6 +221,7 @@ const usage_build_generic =
     \\                     .so    ELF shared object (dynamic link)
     \\                    .dll    Windows Dynamic Link Library
     \\                  .dylib    MACH-O (macOS) dynamic library
+    \\                    .tbd    (macOS) text-based dylib definition
     \\                      .s    Target-specific assembly source code
     \\                      .S    Assembly with C preprocessor (requires LLVM extensions)
     \\                      .c    C source code (requires LLVM extensions)
@@ -268,16 +302,19 @@ const usage_build_generic =
     \\  -T[script], --script [script]  Use a custom linker script
     \\  --version-script [path]        Provide a version .map file
     \\  --dynamic-linker [path]        Set the dynamic interpreter path (usually ld.so)
-    \\  --each-lib-rpath               Add rpath for each used dynamic library
     \\  --version [ver]                Dynamic library semver
     \\  -rdynamic                      Add all symbols to the dynamic symbol table
     \\  -rpath [path]                  Add directory to the runtime library search path
+    \\  -feach-lib-rpath               Ensure adding rpath for each used dynamic library
+    \\  -fno-each-lib-rpath            Prevent adding rpath for each used dynamic library
     \\  --eh-frame-hdr                 Enable C++ exception handling by passing --eh-frame-hdr to linker
+    \\  --emit-relocs                  Enable output of relocation sections for post build tools
     \\  -dynamic                       Force output to be dynamically linked
     \\  -static                        Force output to be statically linked
     \\  -Bsymbolic                     Bind global references locally
     \\  --subsystem [subsystem]        (windows) /SUBSYSTEM:<subsystem> to the linker\n"
     \\  --stack [size]                 Override default stack size
+    \\  --image-base [addr]            Set base address for executable image
     \\  -framework [name]              (darwin) link against framework
     \\  -F[dir]                        (darwin) add search path for frameworks
     \\
@@ -377,7 +414,7 @@ fn buildOutputType(
         run,
     },
 ) !void {
-    var color: Color = .Auto;
+    var color: Color = .auto;
     var optimize_mode: std.builtin.Mode = .Debug;
     var provided_name: ?[]const u8 = null;
     var link_mode: ?std.builtin.LinkMode = null;
@@ -434,12 +471,17 @@ fn buildOutputType(
     var linker_z_defs = false;
     var test_evented_io = false;
     var stack_size_override: ?u64 = null;
+    var image_base_override: ?u64 = null;
     var use_llvm: ?bool = null;
     var use_lld: ?bool = null;
     var use_clang: ?bool = null;
     var link_eh_frame_hdr = false;
-    var each_lib_rpath = false;
-    var libc_paths_file: ?[]const u8 = null;
+    var link_emit_relocs = false;
+    var each_lib_rpath: ?bool = null;
+    var libc_paths_file: ?[]const u8 = std.process.getEnvVarOwned(arena, "ZIG_LIBC") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => |e| return e,
+    };
     var machine_code_model: std.builtin.CodeModel = .default;
     var runtime_args_start: ?usize = null;
     var test_filter: ?[]const u8 = null;
@@ -520,7 +562,7 @@ fn buildOutputType(
             //}
             const args = all_args[2..];
             var i: usize = 0;
-            while (i < args.len) : (i += 1) {
+            args_loop: while (i < args.len) : (i += 1) {
                 const arg = args[i];
                 if (mem.startsWith(u8, arg, "-")) {
                     if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
@@ -528,7 +570,10 @@ fn buildOutputType(
                         return cleanExit();
                     } else if (mem.eql(u8, arg, "--")) {
                         if (arg_mode == .run) {
-                            runtime_args_start = i + 1;
+                            // The index refers to all_args so skip `zig` `run`
+                            // and `--`
+                            runtime_args_start = i + 3;
+                            break :args_loop;
                         } else {
                             fatal("unexpected end-of-parameter mark: --", .{});
                         }
@@ -577,15 +622,9 @@ fn buildOutputType(
                         }
                         i += 1;
                         const next_arg = args[i];
-                        if (mem.eql(u8, next_arg, "auto")) {
-                            color = .Auto;
-                        } else if (mem.eql(u8, next_arg, "on")) {
-                            color = .On;
-                        } else if (mem.eql(u8, next_arg, "off")) {
-                            color = .Off;
-                        } else {
+                        color = std.meta.stringToEnum(Color, next_arg) orelse {
                             fatal("expected [auto|on|off] after --color, found '{}'", .{next_arg});
-                        }
+                        };
                     } else if (mem.eql(u8, arg, "--subsystem")) {
                         if (i + 1 >= args.len) fatal("expected parameter after {}", .{arg});
                         i += 1;
@@ -626,9 +665,11 @@ fn buildOutputType(
                     } else if (mem.eql(u8, arg, "--stack")) {
                         if (i + 1 >= args.len) fatal("expected parameter after {}", .{arg});
                         i += 1;
-                        stack_size_override = std.fmt.parseInt(u64, args[i], 10) catch |err| {
-                            fatal("unable to parse '{}': {}", .{ arg, @errorName(err) });
-                        };
+                        stack_size_override = parseAnyBaseInt(args[i]);
+                    } else if (mem.eql(u8, arg, "--image-base")) {
+                        if (i + 1 >= args.len) fatal("expected parameter after {}", .{arg});
+                        i += 1;
+                        image_base_override = parseAnyBaseInt(args[i]);
                     } else if (mem.eql(u8, arg, "--name")) {
                         if (i + 1 >= args.len) fatal("expected parameter after {}", .{arg});
                         i += 1;
@@ -733,8 +774,10 @@ fn buildOutputType(
                         if (i + 1 >= args.len) fatal("expected parameter after {}", .{arg});
                         i += 1;
                         override_lib_dir = args[i];
-                    } else if (mem.eql(u8, arg, "--each-lib-rpath")) {
+                    } else if (mem.eql(u8, arg, "-feach-lib-rpath")) {
                         each_lib_rpath = true;
+                    } else if (mem.eql(u8, arg, "-fno-each-lib-rpath")) {
+                        each_lib_rpath = false;
                     } else if (mem.eql(u8, arg, "--enable-cache")) {
                         enable_cache = true;
                     } else if (mem.eql(u8, arg, "--test-cmd-bin")) {
@@ -838,6 +881,8 @@ fn buildOutputType(
                         function_sections = true;
                     } else if (mem.eql(u8, arg, "--eh-frame-hdr")) {
                         link_eh_frame_hdr = true;
+                    } else if (mem.eql(u8, arg, "--emit-relocs")) {
+                        link_emit_relocs = true;
                     } else if (mem.eql(u8, arg, "-Bsymbolic")) {
                         linker_bind_global_refs_locally = true;
                     } else if (mem.eql(u8, arg, "--verbose-link")) {
@@ -874,7 +919,7 @@ fn buildOutputType(
                         fatal("unrecognized parameter: '{}'", .{arg});
                     }
                 } else switch (Compilation.classifyFileExt(arg)) {
-                    .object, .static_library => {
+                    .object, .static_library, .shared_library => {
                         try link_objects.append(arg);
                     },
                     .assembly, .c, .cpp, .h, .ll, .bc => {
@@ -882,9 +927,6 @@ fn buildOutputType(
                             .src_path = arg,
                             .extra_flags = try arena.dupe([]const u8, extra_cflags.items),
                         });
-                    },
-                    .shared_library => {
-                        fatal("linking against dynamic libraries not yet supported", .{});
                     },
                     .zig, .zir => {
                         if (root_src_file) |other| {
@@ -978,15 +1020,20 @@ fn buildOutputType(
                     },
                     .optimize => {
                         // Alright, what release mode do they want?
-                        if (mem.eql(u8, it.only_arg, "Os")) {
+                        const level = if (it.only_arg.len >= 1 and it.only_arg[0] == 'O') it.only_arg[1..] else it.only_arg;
+                        if (mem.eql(u8, level, "s") or
+                            mem.eql(u8, level, "z"))
+                        {
                             optimize_mode = .ReleaseSmall;
-                        } else if (mem.eql(u8, it.only_arg, "O2") or
-                            mem.eql(u8, it.only_arg, "O3") or
-                            mem.eql(u8, it.only_arg, "O4"))
+                        } else if (mem.eql(u8, level, "1") or
+                            mem.eql(u8, level, "2") or
+                            mem.eql(u8, level, "3") or
+                            mem.eql(u8, level, "4") or
+                            mem.eql(u8, level, "fast"))
                         {
                             optimize_mode = .ReleaseFast;
-                        } else if (mem.eql(u8, it.only_arg, "Og") or
-                            mem.eql(u8, it.only_arg, "O0"))
+                        } else if (mem.eql(u8, level, "g") or
+                            mem.eql(u8, level, "0"))
                         {
                             optimize_mode = .Debug;
                         } else {
@@ -995,8 +1042,13 @@ fn buildOutputType(
                     },
                     .debug => {
                         strip = false;
-                        if (mem.eql(u8, it.only_arg, "-g")) {
+                        if (mem.eql(u8, it.only_arg, "g")) {
                             // We handled with strip = false above.
+                        } else if (mem.eql(u8, it.only_arg, "g1") or
+                            mem.eql(u8, it.only_arg, "gline-tables-only"))
+                        {
+                            // We handled with strip = false above. but we also want reduced debug info.
+                            try clang_argv.append("-gline-tables-only");
                         } else {
                             try clang_argv.appendSlice(it.other_args);
                         }
@@ -1143,9 +1195,13 @@ fn buildOutputType(
                     if (i >= linker_args.items.len) {
                         fatal("expected linker arg after '{}'", .{arg});
                     }
-                    stack_size_override = std.fmt.parseInt(u64, linker_args.items[i], 10) catch |err| {
-                        fatal("unable to parse '{}': {}", .{ arg, @errorName(err) });
-                    };
+                    stack_size_override = parseAnyBaseInt(linker_args.items[i]);
+                } else if (mem.eql(u8, arg, "--image-base")) {
+                    i += 1;
+                    if (i >= linker_args.items.len) {
+                        fatal("expected linker arg after '{}'", .{arg});
+                    }
+                    image_base_override = parseAnyBaseInt(linker_args.items[i]);
                 } else {
                     warn("unsupported linker arg: {}", .{arg});
                 }
@@ -1204,6 +1260,16 @@ fn buildOutputType(
 
     if (arg_mode == .translate_c and c_source_files.items.len != 1) {
         fatal("translate-c expects exactly 1 source file (found {})", .{c_source_files.items.len});
+    }
+
+    if (root_src_file == null and arg_mode == .zig_test) {
+        fatal("`zig test` expects a zig source file argument", .{});
+    }
+
+    if (link_objects.items.len == 0 and root_src_file == null and
+        c_source_files.items.len == 0 and arg_mode == .run)
+    {
+        fatal("`zig run` expects at least one positional argument", .{});
     }
 
     const root_name = if (provided_name) |n| n else blk: {
@@ -1446,6 +1512,11 @@ fn buildOutputType(
             cleanup_root_dir = dir;
             root_pkg_memory.root_src_directory = .{ .path = p, .handle = dir };
             root_pkg_memory.root_src_path = try fs.path.relative(arena, p, src_path);
+        } else if (fs.path.dirname(src_path)) |p| {
+            const dir = try fs.cwd().openDir(p, .{});
+            cleanup_root_dir = dir;
+            root_pkg_memory.root_src_directory = .{ .path = p, .handle = dir };
+            root_pkg_memory.root_src_path = fs.path.basename(src_path);
         } else {
             root_pkg_memory.root_src_directory = .{ .path = null, .handle = fs.cwd() };
             root_pkg_memory.root_src_path = src_path;
@@ -1580,7 +1651,9 @@ fn buildOutputType(
         .linker_z_nodelete = linker_z_nodelete,
         .linker_z_defs = linker_z_defs,
         .link_eh_frame_hdr = link_eh_frame_hdr,
+        .link_emit_relocs = link_emit_relocs,
         .stack_size_override = stack_size_override,
+        .image_base_override = image_base_override,
         .strip = strip,
         .single_threaded = single_threaded,
         .function_sections = function_sections,
@@ -1640,40 +1713,50 @@ fn buildOutputType(
         warn("--watch is not recommended with the stage1 backend; it leaks memory and is not capable of incremental compilation", .{});
     }
 
-    switch (arg_mode) {
-        .run, .zig_test => run: {
-            const exe_loc = emit_bin_loc orelse break :run;
-            const exe_directory = exe_loc.directory orelse comp.bin_file.options.emit.?.directory;
-            const exe_path = try fs.path.join(arena, &[_][]const u8{
-                exe_directory.path orelse ".", exe_loc.basename,
-            });
+    const run_or_test = switch (arg_mode) {
+        .run, .zig_test => true,
+        else => false,
+    };
+    if (run_or_test) run: {
+        const exe_loc = emit_bin_loc orelse break :run;
+        const exe_directory = exe_loc.directory orelse comp.bin_file.options.emit.?.directory;
+        const exe_path = try fs.path.join(arena, &[_][]const u8{
+            exe_directory.path orelse ".", exe_loc.basename,
+        });
 
-            var argv = std.ArrayList([]const u8).init(gpa);
-            defer argv.deinit();
+        var argv = std.ArrayList([]const u8).init(gpa);
+        defer argv.deinit();
 
-            if (test_exec_args.items.len == 0) {
-                if (!std.Target.current.canExecBinariesOf(target_info.target)) {
-                    switch (arg_mode) {
-                        .zig_test => {
-                            warn("created {s} but skipping execution because it is non-native", .{exe_path});
-                            if (!watch) return cleanExit();
-                            break :run;
-                        },
-                        .run => fatal("unable to execute {s}: non-native", .{exe_path}),
-                        else => unreachable,
-                    }
-                }
-                try argv.append(exe_path);
-            } else {
-                for (test_exec_args.items) |arg| {
-                    try argv.append(arg orelse exe_path);
+        if (test_exec_args.items.len == 0) {
+            if (!std.Target.current.canExecBinariesOf(target_info.target)) {
+                switch (arg_mode) {
+                    .zig_test => {
+                        warn("created {s} but skipping execution because it is non-native", .{exe_path});
+                        if (!watch) return cleanExit();
+                        break :run;
+                    },
+                    .run => fatal("unable to execute {s}: non-native", .{exe_path}),
+                    else => unreachable,
                 }
             }
-            if (runtime_args_start) |i| {
-                try argv.appendSlice(all_args[i..]);
+            try argv.append(exe_path);
+        } else {
+            for (test_exec_args.items) |arg| {
+                try argv.append(arg orelse exe_path);
             }
-            // TODO On operating systems that support it, do an execve here rather than child process,
-            // when watch=false and arg_mode == .run
+        }
+        if (runtime_args_start) |i| {
+            try argv.appendSlice(all_args[i..]);
+        }
+        // We do not execve for tests because if the test fails we want to print the error message and
+        // invocation below.
+        if (os_can_execve and arg_mode == .run and !watch) {
+            // TODO improve the std lib so that we don't need a call to getEnvMap here.
+            var env_vars = try process.getEnvMap(arena);
+            const err = std.os.execvpe(gpa, argv.items, &env_vars);
+            const cmd = try argvCmd(arena, argv.items);
+            fatal("the following command failed to execve with '{s}':\n{s}", .{ @errorName(err), cmd });
+        } else {
             const child = try std.ChildProcess.init(argv.items, gpa);
             defer child.deinit();
 
@@ -1714,8 +1797,7 @@ fn buildOutputType(
                 },
                 else => unreachable,
             }
-        },
-        else => {},
+        }
     }
 
     const stdin = std.io.getStdIn().inStream();
@@ -2335,10 +2417,11 @@ const Fmt = struct {
 
 pub fn cmdFmt(gpa: *Allocator, args: []const []const u8) !void {
     const stderr_file = io.getStdErr();
-    var color: Color = .Auto;
+    var color: Color = .auto;
     var stdin_flag: bool = false;
     var check_flag: bool = false;
     var input_files = ArrayList([]const u8).init(gpa);
+    defer input_files.deinit();
 
     {
         var i: usize = 0;
@@ -2355,15 +2438,9 @@ pub fn cmdFmt(gpa: *Allocator, args: []const []const u8) !void {
                     }
                     i += 1;
                     const next_arg = args[i];
-                    if (mem.eql(u8, next_arg, "auto")) {
-                        color = .Auto;
-                    } else if (mem.eql(u8, next_arg, "on")) {
-                        color = .On;
-                    } else if (mem.eql(u8, next_arg, "off")) {
-                        color = .Off;
-                    } else {
+                    color = std.meta.stringToEnum(Color, next_arg) orelse {
                         fatal("expected [auto|on|off] after --color, found '{}'", .{next_arg});
-                    }
+                    };
                 } else if (mem.eql(u8, arg, "--stdin")) {
                     stdin_flag = true;
                 } else if (mem.eql(u8, arg, "--check")) {
@@ -2525,7 +2602,7 @@ fn fmtPathFile(
     const source_code = source_file.readToEndAllocOptions(
         fmt.gpa,
         max_src_size,
-        stat.size,
+        std.math.cast(usize, stat.size) catch return error.FileTooBig,
         @alignOf(u8),
         null,
     ) catch |err| switch (err) {
@@ -2555,8 +2632,8 @@ fn fmtPathFile(
     if (check_mode) {
         const anything_changed = try std.zig.render(fmt.gpa, io.null_out_stream, tree);
         if (anything_changed) {
-            // TODO this should output to stdout instead of stderr.
-            std.debug.print("{}\n", .{file_path});
+            const stdout = io.getStdOut().writer();
+            try stdout.print("{}\n", .{file_path});
             fmt.any_error = true;
         }
     } else {
@@ -2573,8 +2650,8 @@ fn fmtPathFile(
 
         try af.file.writeAll(fmt.out_buffer.items);
         try af.finish();
-        // TODO this should output to stdout instead of stderr.
-        std.debug.print("{}\n", .{file_path});
+        const stdout = io.getStdOut().writer();
+        try stdout.print("{}\n", .{file_path});
     }
 }
 
@@ -2587,9 +2664,9 @@ fn printErrMsgToFile(
     color: Color,
 ) !void {
     const color_on = switch (color) {
-        .Auto => file.isTty(),
-        .On => true,
-        .Off => false,
+        .auto => file.isTty(),
+        .on => true,
+        .off => false,
     };
     const lok_token = parse_error.loc();
     const span_first = lok_token;
@@ -2905,35 +2982,37 @@ fn parseCodeModel(arg: []const u8) std.builtin.CodeModel {
 /// garbage collector to run concurrently to zig processes, and to allow multiple
 /// zig processes to run concurrently with each other, without clobbering each other.
 fn gimmeMoreOfThoseSweetSweetFileDescriptors() void {
-    switch (std.Target.current.os.tag) {
-        .windows, .wasi, .uefi, .other, .freestanding => return,
-        // std lib is missing getrlimit/setrlimit.
-        // https://github.com/ziglang/zig/issues/6361
-        //else => {},
-        else => return,
-    }
+    if (!@hasDecl(std.os, "rlimit")) return;
     const posix = std.os;
-    var lim = posix.getrlimit(posix.RLIMIT_NOFILE, &lim) catch return; // Oh well; we tried.
+
+    var lim = posix.getrlimit(.NOFILE) catch return; // Oh well; we tried.
+    if (comptime std.Target.current.isDarwin()) {
+        // On Darwin, `NOFILE` is bounded by a hardcoded value `OPEN_MAX`.
+        // According to the man pages for setrlimit():
+        //   setrlimit() now returns with errno set to EINVAL in places that historically succeeded.
+        //   It no longer accepts "rlim_cur = RLIM_INFINITY" for RLIM_NOFILE.
+        //   Use "rlim_cur = min(OPEN_MAX, rlim_max)".
+        lim.max = std.math.min(std.os.darwin.OPEN_MAX, lim.max);
+    }
     if (lim.cur == lim.max) return;
+
+    // Do a binary search for the limit.
+    var min: posix.rlim_t = lim.cur;
+    var max: posix.rlim_t = 1 << 20;
+    // But if there's a defined upper bound, don't search, just set it.
+    if (lim.max != posix.RLIM_INFINITY) {
+        min = lim.max;
+        max = lim.max;
+    }
+
     while (true) {
-        // Do a binary search for the limit.
-        var min: posix.rlim_t = lim.cur;
-        var max: posix.rlim_t = 1 << 20;
-        // But if there's a defined upper bound, don't search, just set it.
-        if (lim.max != posix.RLIM_INFINITY) {
-            min = lim.max;
-            max = lim.max;
+        lim.cur = min + @divTrunc(max - min, 2); // on freebsd rlim_t is signed
+        if (posix.setrlimit(.NOFILE, lim)) |_| {
+            min = lim.cur;
+        } else |_| {
+            max = lim.cur;
         }
-        while (true) {
-            lim.cur = min + (max - min) / 2;
-            if (posix.setrlimit(posix.RLIMIT_NOFILE, lim)) |_| {
-                min = lim.cur;
-            } else |_| {
-                max = lim.cur;
-            }
-            if (min + 1 < max) continue;
-            return;
-        }
+        if (min + 1 >= max) break;
     }
 }
 
@@ -3036,4 +3115,19 @@ pub fn cleanExit() void {
     } else {
         process.exit(0);
     }
+}
+
+fn parseAnyBaseInt(prefixed_bytes: []const u8) u64 {
+    const base: u8 = if (mem.startsWith(u8, prefixed_bytes, "0x"))
+        16
+    else if (mem.startsWith(u8, prefixed_bytes, "0o"))
+        8
+    else if (mem.startsWith(u8, prefixed_bytes, "0b"))
+        2
+    else
+        @as(u8, 10);
+    const bytes = if (base == 10) prefixed_bytes else prefixed_bytes[2..];
+    return std.fmt.parseInt(u64, bytes, base) catch |err| {
+        fatal("unable to parse '{}': {}", .{ prefixed_bytes, @errorName(err) });
+    };
 }

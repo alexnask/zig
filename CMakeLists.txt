@@ -27,23 +27,26 @@ set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake ${CMAKE_MODULE_PATH})
 set(ZIG_VERSION_MAJOR 0)
 set(ZIG_VERSION_MINOR 6)
 set(ZIG_VERSION_PATCH 0)
-set(ZIG_VERSION "${ZIG_VERSION_MAJOR}.${ZIG_VERSION_MINOR}.${ZIG_VERSION_PATCH}")
+set(ZIG_VERSION "" CACHE STRING "Override Zig version string. Default is to find out with git.")
 
-find_program(GIT_EXE NAMES git)
-if(GIT_EXE)
-    execute_process(
-        COMMAND ${GIT_EXE} -C ${CMAKE_SOURCE_DIR} name-rev HEAD --tags --name-only --no-undefined --always
-        RESULT_VARIABLE EXIT_STATUS
-        OUTPUT_VARIABLE ZIG_GIT_REV
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET)
-    if(EXIT_STATUS EQUAL "0")
-        if(ZIG_GIT_REV MATCHES "\\^0$")
-            if(NOT("${ZIG_GIT_REV}" STREQUAL "${ZIG_VERSION}^0"))
-                message("WARNING: Tag does not match configured Zig version")
+if("${ZIG_VERSION}" STREQUAL "")
+    set(ZIG_VERSION "${ZIG_VERSION_MAJOR}.${ZIG_VERSION_MINOR}.${ZIG_VERSION_PATCH}")
+    find_program(GIT_EXE NAMES git)
+    if(GIT_EXE)
+        execute_process(
+            COMMAND ${GIT_EXE} -C ${CMAKE_SOURCE_DIR} name-rev HEAD --tags --name-only --no-undefined --always
+            RESULT_VARIABLE EXIT_STATUS
+            OUTPUT_VARIABLE ZIG_GIT_REV
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(EXIT_STATUS EQUAL "0")
+            if(ZIG_GIT_REV MATCHES "\\^0$")
+                if(NOT("${ZIG_GIT_REV}" STREQUAL "${ZIG_VERSION}^0"))
+                    message("WARNING: Tag does not match configured Zig version")
+                endif()
+            else()
+                set(ZIG_VERSION "${ZIG_VERSION}+${ZIG_GIT_REV}")
             endif()
-        else()
-            set(ZIG_VERSION "${ZIG_VERSION}+${ZIG_GIT_REV}")
         endif()
     endif()
 endif()
@@ -52,10 +55,7 @@ message("Configuring zig version ${ZIG_VERSION}")
 set(ZIG_STATIC off CACHE BOOL "Attempt to build a static zig executable (not compatible with glibc)")
 set(ZIG_STATIC_LLVM off CACHE BOOL "Prefer linking against static LLVM libraries")
 set(ZIG_PREFER_CLANG_CPP_DYLIB off CACHE BOOL "Try to link against -lclang-cpp")
-set(ZIG_WORKAROUND_4799 off CACHE BOOL "workaround for https://github.com/ziglang/zig/issues/4799")
-set(ZIG_WORKAROUND_POLLY_SO off CACHE STRING "workaround for https://github.com/ziglang/zig/issues/4799")
 set(ZIG_USE_CCACHE off CACHE BOOL "Use ccache if available")
-set(ZIG_WORKAROUND_6087 off CACHE BOOL "workaround for https://github.com/ziglang/zig/issues/6087")
 
 if(CCACHE_PROGRAM AND ZIG_USE_CCACHE)
     SET_PROPERTY(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
@@ -63,6 +63,9 @@ endif()
 
 if(ZIG_STATIC)
     set(ZIG_STATIC_LLVM "on")
+    set(ZIG_LINK_MODE "Static")
+else()
+    set(ZIG_LINK_MODE "Dynamic")
 endif()
 
 string(REGEX REPLACE "\\\\" "\\\\\\\\" ZIG_LIBC_LIB_DIR_ESCAPED "${ZIG_LIBC_LIB_DIR}")
@@ -74,6 +77,7 @@ option(ZIG_TEST_COVERAGE "Build Zig with test coverage instrumentation" OFF)
 set(ZIG_TARGET_TRIPLE "native" CACHE STRING "arch-os-abi to output binaries for")
 set(ZIG_TARGET_MCPU "baseline" CACHE STRING "-mcpu parameter to output binaries for")
 set(ZIG_EXECUTABLE "" CACHE STRING "(when cross compiling) path to already-built zig binary")
+set(ZIG_PREFER_LLVM_CONFIG off CACHE BOOL "(when cross compiling) use llvm-config to find target llvm dependencies if needed")
 
 find_package(llvm)
 find_package(clang)
@@ -81,18 +85,12 @@ find_package(lld)
 
 if(APPLE AND ZIG_STATIC)
     list(REMOVE_ITEM LLVM_LIBRARIES "-lz")
-    find_library(ZLIB NAMES z zlib libz)
+    find_library(ZLIB NAMES libz.a z zlib libz)
     list(APPEND LLVM_LIBRARIES "${ZLIB}")
-endif()
 
-if(APPLE AND ZIG_WORKAROUND_6087)
-    list(REMOVE_ITEM LLVM_LIBRARIES "-llibxml2.tbd")
-    list(APPEND LLVM_LIBRARIES "-lxml2")
-endif()
-
-if(APPLE AND ZIG_WORKAROUND_4799)
-  # eg: ${CMAKE_PREFIX_PATH} could be /usr/local/opt/llvm/
-  list(APPEND LLVM_LIBRARIES "-Wl,${CMAKE_PREFIX_PATH}/lib/libPolly.a" "-Wl,${CMAKE_PREFIX_PATH}/lib/libPollyPPCG.a" "-Wl,${CMAKE_PREFIX_PATH}/lib/libPollyISL.a")
+    list(REMOVE_ITEM LLVM_LIBRARIES "-lcurses")
+    find_library(CURSES NAMES libcurses.a curses libcurses libncurses.a ncurses libncurses)
+    list(APPEND LLVM_LIBRARIES "${CURSES}")
 endif()
 
 set(ZIG_CPP_LIB_DIR "${CMAKE_BINARY_DIR}/zigcpp")
@@ -257,7 +255,6 @@ target_include_directories(embedded_softfloat PUBLIC
 )
 include_directories("${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/include")
 set(SOFTFLOAT_LIBRARIES embedded_softfloat)
-include_directories("${CMAKE_SOURCE_DIR}/deps/dbg-macro")
 
 find_package(Threads)
 
@@ -357,7 +354,7 @@ endif()
 if(MSVC)
     set(EXE_CFLAGS "${EXE_CFLAGS}")
 else()
-    set(EXE_CFLAGS "${EXE_CFLAGS} -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D_GNU_SOURCE -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -Werror=type-limits -Wno-missing-braces")
+    set(EXE_CFLAGS "${EXE_CFLAGS} -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D_GNU_SOURCE -fvisibility-inlines-hidden -fno-exceptions -fno-rtti -Werror=type-limits -Wno-missing-braces -Wno-comment")
     if(MINGW)
         set(EXE_CFLAGS "${EXE_CFLAGS} -Wno-format")
     endif()
@@ -409,9 +406,6 @@ target_link_libraries(zigcpp LINK_PUBLIC
     ${LLVM_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )
-if(ZIG_WORKAROUND_POLLY_SO)
-  target_link_libraries(zigcpp LINK_PUBLIC "-Wl,${ZIG_WORKAROUND_POLLY_SO}")
-endif()
 
 add_library(opt_c_util STATIC ${OPTIMIZED_C_SOURCES})
 set_target_properties(opt_c_util PROPERTIES
@@ -473,7 +467,7 @@ set(BUILD_ZIG1_ARGS
     --pkg-end
 )
 
-if("${ZIG_TARGET_TRIPLE}" STREQUAL "native")
+if("${ZIG_EXECUTABLE}" STREQUAL "")
   add_custom_target(zig_build_zig1 ALL
       COMMAND zig0 ${BUILD_ZIG1_ARGS}
       DEPENDS zig0
@@ -487,7 +481,7 @@ if("${ZIG_TARGET_TRIPLE}" STREQUAL "native")
   endif()
 else()
   add_custom_target(zig_build_zig1 ALL
-      COMMAND "${ZIG_EXECUTABLE}" ${BUILD_ZIG1_ARGS}
+      COMMAND "${ZIG_EXECUTABLE}" "build-obj" ${BUILD_ZIG1_ARGS}
       BYPRODUCTS "${ZIG1_OBJECT}"
       COMMENT STATUS "Building self-hosted component ${ZIG1_OBJECT}"
       WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
