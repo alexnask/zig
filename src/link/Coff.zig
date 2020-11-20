@@ -21,7 +21,10 @@ const allocation_padding = 4 / 3;
 const minimum_text_block_size = 64 * allocation_padding;
 
 const section_alignment = 4096;
-const file_alignment = 512;
+const file_alignment = 256;
+
+const default_offset_table_size = std.math.max(512, file_alignment);
+const default_size_of_code = 0;
 const default_image_base = 0x400_000;
 const section_table_size = 2 * 40;
 comptime {
@@ -146,7 +149,7 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     var coff_file_header_offset: u32 = 0;
     if (options.output_mode == .Exe) {
         // Write the MS-DOS stub and the PE signature
-        try self.base.file.?.pwriteAll(msdos_stub ++ "PE\x00\x00", 0);
+        try file.pwriteAll(msdos_stub ++ "PE\x00\x00", 0);
         coff_file_header_offset = msdos_stub.len + 4;
     }
 
@@ -178,14 +181,11 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     };
 
     const section_table_offset = coff_file_header_offset + 20 + optional_header_size;
-    const default_offset_table_size = file_alignment;
-    const default_size_of_code = 0;
-
+    self.section_table_offset = section_table_offset;
     self.section_data_offset = mem.alignForwardGeneric(u32, self.section_table_offset + section_table_size, file_alignment);
     const section_data_relative_virtual_address = mem.alignForwardGeneric(u32, self.section_table_offset + section_table_size, section_alignment);
     self.offset_table_virtual_address = default_image_base + section_data_relative_virtual_address;
     self.offset_table_size = default_offset_table_size;
-    self.section_table_offset = section_table_offset;
     self.text_section_virtual_address = default_image_base + section_data_relative_virtual_address + section_alignment;
     self.text_section_size = default_size_of_code;
 
@@ -208,12 +208,12 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     index += 2;
 
     assert(index == 20);
-    try self.base.file.?.pwriteAll(hdr_data[0..index], coff_file_header_offset);
+    try file.pwriteAll(hdr_data[0..index], coff_file_header_offset);
 
+    index = 0;
     if (options.output_mode == .Exe) {
         self.optional_header_offset = coff_file_header_offset + 20;
         // Optional header
-        index = 0;
         mem.writeIntLittle(u16, hdr_data[0..2], switch (self.ptr_width) {
             .p32 => @as(u16, 0x10b),
             .p64 => 0x20b,
@@ -378,8 +378,8 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     index += 4;
 
     assert(index == optional_header_size + section_table_size);
-    try self.base.file.?.pwriteAll(hdr_data[0..index], self.optional_header_offset);
-    try self.base.file.?.setEndPos(self.section_data_offset + default_offset_table_size + default_size_of_code);
+    try file.pwriteAll(hdr_data[0..index], self.optional_header_offset);
+    try file.setEndPos(self.section_data_offset + default_offset_table_size + default_size_of_code);
 
     return self;
 }
