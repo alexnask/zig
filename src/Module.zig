@@ -1006,7 +1006,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             const body_node = fn_proto.getBodyNode() orelse
                 return self.failTok(&fn_type_scope.base, fn_proto.fn_token, "TODO implement extern functions", .{});
 
-            const param_decls = fn_proto.params();
+            const param_decls = fn_proto.paramsConst();
             const param_types = try fn_type_scope.arena.alloc(*zir.Inst, param_decls.len);
 
             const fn_src = tree.token_locs[fn_proto.fn_token].start;

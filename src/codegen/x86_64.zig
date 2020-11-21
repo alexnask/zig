@@ -133,8 +133,10 @@ pub const Register = enum(u8) {
 
 /// These registers belong to the called function.
 pub const callee_preserved_regs = [_]Register{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9, .r10, .r11 };
-pub const c_abi_int_param_regs = [_]Register{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
-pub const c_abi_int_return_regs = [_]Register{ .rax, .rdx };
+pub const systemv_abi_int_param_regs = [_]Register{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+pub const systemv_abi_int_return_regs = [_]Register{ .rax, .rdx };
+pub const win64_abi_int_param_regs = [_]Register{ .rcx, .rdx, .r8, .r9 };
+pub const win64_abi_int_return_regs = [_]Register{ .rax };
 
 // TODO add these registers to the enum and populate dwarfLocOp
 //    // Return Address register. This is stored in `0(%rsp, "")` and is not a physical register.

@@ -3011,20 +3011,25 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                             result.stack_align = 1;
                             return result;
                         },
-                        .Unspecified, .C => {
+                        .Unspecified, .C, .Stdcall => {
                             var next_int_reg: usize = 0;
                             var next_stack_offset: u32 = 0;
+
+                            const int_param_regs = if (self.target.os.tag == .windows)
+                                &win64_abi_int_param_regs
+                            else
+                                &systemv_abi_int_param_regs;
 
                             for (param_types) |ty, i| {
                                 switch (ty.zigTypeTag()) {
                                     .Bool, .Int => {
                                         const param_size = @intCast(u32, ty.abiSize(self.target.*));
-                                        if (next_int_reg >= c_abi_int_param_regs.len) {
+                                        if (next_int_reg >= int_param_regs.len) {
                                             result.args[i] = .{ .stack_offset = next_stack_offset };
                                             next_stack_offset += param_size;
                                         } else {
                                             const aliased_reg = registerAlias(
-                                                c_abi_int_param_regs[next_int_reg],
+                                                int_param_regs[next_int_reg],
                                                 param_size,
                                             );
                                             result.args[i] = .{ .register = aliased_reg };
@@ -3049,7 +3054,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                             result.stack_align = 1;
                             return result;
                         },
-                        .Unspecified, .C => {
+                        .Unspecified, .C, .Stdcall => {
                             // ARM Procedure Call Standard, Chapter 6.5
                             var ncrn: usize = 0; // Next Core Register Number
                             var nsaa: u32 = 0; // Next stacked argument address
@@ -3100,16 +3105,21 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             } else switch (arch) {
                 .x86_64 => switch (cc) {
                     .Naked => unreachable,
-                    .Unspecified, .C => {
+                    .Unspecified, .C, .Stdcall => {
+                        const int_return_regs = if (self.target.os.tag == .windows)
+                            &win64_abi_int_return_regs
+                        else
+                            &systemv_abi_int_return_regs;
+
                         const ret_ty_size = @intCast(u32, ret_ty.abiSize(self.target.*));
-                        const aliased_reg = registerAlias(c_abi_int_return_regs[0], ret_ty_size);
+                        const aliased_reg = registerAlias(int_return_regs[0], ret_ty_size);
                         result.return_value = .{ .register = aliased_reg };
                     },
                     else => return self.fail(src, "TODO implement function return values for {}", .{cc}),
                 },
                 .arm, .armeb => switch (cc) {
                     .Naked => unreachable,
-                    .Unspecified, .C => {
+                    .Unspecified, .C, .Stdcall => {
                         const ret_ty_size = @intCast(u32, ret_ty.abiSize(self.target.*));
                         if (ret_ty_size <= 4) {
                             result.return_value = .{ .register = c_abi_int_return_regs[0] };
