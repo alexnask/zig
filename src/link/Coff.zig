@@ -16,17 +16,23 @@ const link = @import("../link.zig");
 const build_options = @import("build_options");
 const Cache = @import("../Cache.zig");
 const mingw = @import("../mingw.zig");
+const Value = @import("../value.zig").Value;
 
 const allocation_padding = 4 / 3;
 const minimum_text_block_size = 64 * allocation_padding;
 
 const section_alignment = 4096;
-const file_alignment = 256;
+const file_alignment = 512;
+
+const data_directory_count = 16;
 
 const default_offset_table_size = std.math.max(512, file_alignment);
+const default_import_section_size = std.math.max(512, file_alignment);
+
 const default_size_of_code = 0;
 const default_image_base = 0x400_000;
-const section_table_size = 2 * 40;
+const number_of_sections = 3;
+const section_table_size = number_of_sections * 40;
 comptime {
     assert(mem.isAligned(default_image_base, section_alignment));
 }
@@ -41,6 +47,9 @@ error_flags: link.File.ErrorFlags = .{},
 
 text_block_free_list: std.ArrayListUnmanaged(*TextBlock) = .{},
 last_text_block: ?*TextBlock = null,
+
+/// Virtual address of the entry point procedure relative to image base.
+entry_addr: ?u32 = null,
 
 /// Section table file pointer.
 section_table_offset: u32 = 0,
@@ -58,8 +67,10 @@ offset_table: std.ArrayListUnmanaged(u64) = .{},
 /// Free list of offset table indices
 offset_table_free_list: std.ArrayListUnmanaged(u32) = .{},
 
-/// Virtual address of the entry point procedure relative to image base.
-entry_addr: ?u32 = null,
+/// Absolute virtual address of the import section when the executable is loaded in memory.
+import_section_virtual_address: u32 = 0,
+/// Current size of the `.idata` section on disk, must be a multiple of `file_alignment`
+import_section_size: u32 = 0,
 
 /// Absolute virtual address of the text section when the executable is loaded in memory.
 text_section_virtual_address: u32 = 0,
@@ -67,6 +78,7 @@ text_section_virtual_address: u32 = 0,
 text_section_size: u32 = 0,
 
 offset_table_size_dirty: bool = false,
+import_section_size_dirty: bool = false,
 text_section_size_dirty: bool = false,
 /// This flag is set when the virtual size of the whole image file when loaded in memory has changed
 /// and needs to be updated in the optional header.
@@ -154,7 +166,6 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     }
 
     // COFF file header
-    const data_directory_count = 0;
     var hdr_data: [112 + data_directory_count * 8 + section_table_size]u8 = undefined;
     var index: usize = 0;
 
@@ -165,8 +176,8 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     mem.writeIntLittle(u16, hdr_data[0..2], @enumToInt(machine));
     index += 2;
 
-    // Number of sections (we only use .got, .text)
-    mem.writeIntLittle(u16, hdr_data[index..][0..2], 2);
+    // Number of sections (we only use .got, .idata, .text)
+    mem.writeIntLittle(u16, hdr_data[index..][0..2], number_of_sections);
     index += 2;
     // TimeDateStamp (u32), PointerToSymbolTable (u32), NumberOfSymbols (u32)
     mem.set(u8, hdr_data[index..][0..12], 0);
@@ -180,13 +191,14 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
         else => 0,
     };
 
-    const section_table_offset = coff_file_header_offset + 20 + optional_header_size;
-    self.section_table_offset = section_table_offset;
+    self.section_table_offset = coff_file_header_offset + 20 + optional_header_size;
     self.section_data_offset = mem.alignForwardGeneric(u32, self.section_table_offset + section_table_size, file_alignment);
     const section_data_relative_virtual_address = mem.alignForwardGeneric(u32, self.section_table_offset + section_table_size, section_alignment);
     self.offset_table_virtual_address = default_image_base + section_data_relative_virtual_address;
     self.offset_table_size = default_offset_table_size;
-    self.text_section_virtual_address = default_image_base + section_data_relative_virtual_address + section_alignment;
+    self.import_section_virtual_address = default_image_base + section_data_relative_virtual_address + section_alignment;
+    self.import_section_size = default_import_section_size;
+    self.text_section_virtual_address = default_image_base + section_data_relative_virtual_address + 2 * section_alignment;
     self.text_section_size = default_size_of_code;
 
     // Size of file when loaded in memory
@@ -325,7 +337,11 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     index += 8;
     if (options.output_mode == .Exe) {
         // Virtual size (u32)
-        mem.writeIntLittle(u32, hdr_data[index..][0..4], default_offset_table_size);
+        mem.writeIntLittle(
+            u32,
+            hdr_data[index..][0..4],
+            comptime mem.alignForwardGeneric(u32, default_offset_table_size, section_alignment),
+        );
         index += 4;
         // Virtual address (u32)
         mem.writeIntLittle(u32, hdr_data[index..][0..4], self.offset_table_virtual_address - default_image_base);
@@ -346,6 +362,40 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     // Section flags
     mem.writeIntLittle(u32, hdr_data[index..][0..4], std.coff.IMAGE_SCN_CNT_INITIALIZED_DATA | std.coff.IMAGE_SCN_MEM_READ);
     index += 4;
+    // Next, the .idata section
+    hdr_data[index..][0..8].* = ".idata\x00\x00".*;
+    index += 8;
+    if (options.output_mode == .Exe) {
+        // Virtual size (u32)
+        mem.writeIntLittle(
+            u32,
+            hdr_data[index..][0..4],
+            comptime mem.alignForwardGeneric(u32, default_import_section_size, section_alignment),
+        );
+        index += 4;
+        // Virtual address (u32)
+        mem.writeIntLittle(u32, hdr_data[index..][0..4], self.import_section_virtual_address - default_image_base);
+        index += 4;
+    } else {
+        mem.set(u8, hdr_data[index..][0..8], 0);
+        index += 8;
+    }
+    // Size of raw data (u32)
+    mem.writeIntLittle(u32, hdr_data[index..][0..4], default_import_section_size);
+    index += 4;
+    // File pointer to the start of the section
+    mem.writeIntLittle(u32, hdr_data[index..][0..4], self.section_data_offset + default_offset_table_size);
+    index += 4;
+    // Pointer to relocations (u32), PointerToLinenumbers (u32), NumberOfRelocations (u16), NumberOfLinenumbers (u16)
+    mem.set(u8, hdr_data[index..][0..12], 0);
+    index += 12;
+    // Section flags
+    mem.writeIntLittle(
+        u32,
+        hdr_data[index..][0..4],
+        std.coff.IMAGE_SCN_CNT_INITIALIZED_DATA | std.coff.IMAGE_SCN_MEM_READ | std.coff.IMAGE_SCN_MEM_WRITE,
+    );
+    index += 4;
     // Then, the .text section
     hdr_data[index..][0..8].* = ".text\x00\x00\x00".*;
     index += 8;
@@ -364,7 +414,7 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
     mem.writeIntLittle(u32, hdr_data[index..][0..4], default_size_of_code);
     index += 4;
     // File pointer to the start of the section
-    mem.writeIntLittle(u32, hdr_data[index..][0..4], self.section_data_offset + default_offset_table_size);
+    mem.writeIntLittle(u32, hdr_data[index..][0..4], self.section_data_offset + default_offset_table_size + default_import_section_size);
     index += 4;
     // Pointer to relocations (u32), PointerToLinenumbers (u32), NumberOfRelocations (u16), NumberOfLinenumbers (u16)
     mem.set(u8, hdr_data[index..][0..12], 0);
@@ -379,7 +429,7 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
 
     assert(index == optional_header_size + section_table_size);
     try file.pwriteAll(hdr_data[0..index], self.optional_header_offset);
-    try file.setEndPos(self.section_data_offset + default_offset_table_size + default_size_of_code);
+    try file.setEndPos(self.section_data_offset + default_offset_table_size + default_import_section_size + default_size_of_code);
 
     return self;
 }
@@ -404,6 +454,13 @@ pub fn createEmpty(gpa: *Allocator, options: link.Options) !*Coff {
 }
 
 pub fn allocateDeclIndexes(self: *Coff, decl: *Module.Decl) !void {
+    const typed_value = decl.typed_value.most_recent.typed_value;
+    if (typed_value.val.cast(Value.Payload.ExternFunction)) |extern_func| {
+        // @TODO
+        log.crit("TODO extern functions in COFF linker", .{});
+        std.process.exit(1);
+    }
+
     try self.offset_table.ensureCapacity(self.base.allocator, self.offset_table.items.len + 1);
 
     if (self.offset_table_free_list.popOrNull()) |i| {
@@ -476,8 +533,13 @@ fn allocateTextBlock(self: *Coff, text_block: *TextBlock, new_block_size: u64, a
                 // Write new virtual size
                 var buf: [4]u8 = undefined;
                 mem.writeIntLittle(u32, &buf, new_text_section_virtual_size);
-                try self.base.file.?.pwriteAll(&buf, self.section_table_offset + 40 + 8);
+                try self.base.file.?.pwriteAll(&buf, self.section_table_offset + 2 * 40 + 8);
             }
+
+            log.debug(".text section resized: {Bi} (virtual size: {Bi}) -> {Bi} (virtual size: {Bi})", .{
+                self.text_section_size, current_text_section_virtual_size,
+                needed_size,            new_text_section_virtual_size,
+            });
 
             self.text_section_size = needed_size;
             self.text_section_size_dirty = true;
@@ -570,20 +632,28 @@ fn writeOffsetTableEntry(self: *Coff, index: usize) !void {
         const new_raw_size = self.offset_table_size * 2;
         log.debug("growing offset table from raw size {} to {}\n", .{ current_raw_size, new_raw_size });
 
-        // Move the text section to a new place in the executable
-        const current_text_section_start = self.section_data_offset + current_raw_size;
-        const new_text_section_start = self.section_data_offset + new_raw_size;
+        // Move the idata and text sections to a new place in the executable
+        const current_idata_section_start = self.section_data_offset + current_raw_size;
+        const new_idata_section_start = self.section_data_offset + new_raw_size;
 
-        const amt = try self.base.file.?.copyRangeAll(current_text_section_start, self.base.file.?, new_text_section_start, self.text_section_size);
-        if (amt != self.text_section_size) return error.InputOutput;
+        const amt = try self.base.file.?.copyRangeAll(
+            current_idata_section_start,
+            self.base.file.?,
+            new_idata_section_start,
+            self.import_section_size + self.text_section_size,
+        );
+        if (amt != self.import_section_size + self.text_section_size) return error.InputOutput;
 
         // Write the new raw size in the .got header
         var buf: [8]u8 = undefined;
         mem.writeIntLittle(u32, buf[0..4], new_raw_size);
         try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 16);
-        // Write the new .text section file offset in the .text section header
-        mem.writeIntLittle(u32, buf[0..4], new_text_section_start);
+        // Write the new .idata section file offset in the .idata section header
+        mem.writeIntLittle(u32, buf[0..4], new_idata_section_start);
         try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 40 + 20);
+        // Write the new .text section file offset in the .text section header
+        mem.writeIntLittle(u32, buf[0..4], new_idata_section_start + self.import_section_size);
+        try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 2 * 40 + 20);
 
         const current_virtual_size = mem.alignForwardGeneric(u32, self.offset_table_size, section_alignment);
         const new_virtual_size = mem.alignForwardGeneric(u32, new_raw_size, section_alignment);
@@ -599,10 +669,15 @@ fn writeOffsetTableEntry(self: *Coff, index: usize) !void {
             mem.writeIntLittle(u32, buf[0..4], new_virtual_size);
             try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 8);
 
+            // Write .idata new virtual address
+            self.import_section_virtual_address = self.import_section_virtual_address + va_offset;
+            mem.writeIntLittle(u32, buf[0..4], self.import_section_virtual_address - default_image_base);
+            try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 40 + 12);
+
             // Write .text new virtual address
             self.text_section_virtual_address = self.text_section_virtual_address + va_offset;
             mem.writeIntLittle(u32, buf[0..4], self.text_section_virtual_address - default_image_base);
-            try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 40 + 12);
+            try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 2 * 40 + 12);
 
             // Fix the VAs in the offset table
             for (self.offset_table.items) |*va, idx| {
@@ -690,7 +765,10 @@ pub fn updateDecl(self: *Coff, module: *Module, decl: *Module.Decl) !void {
     }
 
     // Write the code into the file
-    try self.base.file.?.pwriteAll(code, self.section_data_offset + self.offset_table_size + decl.link.coff.text_offset);
+    try self.base.file.?.pwriteAll(
+        code,
+        self.section_data_offset + self.offset_table_size + self.import_section_size + decl.link.coff.text_offset,
+    );
 
     // Since we updated the vaddr and the size, each corresponding export symbol also needs to be updated.
     const decl_exports = module.decl_exports.get(decl) orelse &[0]*Module.Export{};
@@ -744,16 +822,25 @@ pub fn flushModule(self: *Coff, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
+    if (self.import_section_size_dirty) {
+        // Write the new raw size in the .idata header
+        var buf: [4]u8 = undefined;
+        mem.writeIntLittle(u32, &buf, self.import_section_size);
+        try self.base.file.?.pwriteAll(&buf, self.section_table_offset + 40 + 16);
+        self.import_section_size_dirty = false;
+    }
+
     if (self.text_section_size_dirty) {
         // Write the new raw size in the .text header
         var buf: [4]u8 = undefined;
         mem.writeIntLittle(u32, &buf, self.text_section_size);
-        try self.base.file.?.pwriteAll(&buf, self.section_table_offset + 40 + 16);
-        try self.base.file.?.setEndPos(self.section_data_offset + self.offset_table_size + self.text_section_size);
+        try self.base.file.?.pwriteAll(&buf, self.section_table_offset + 2 * 40 + 16);
+        try self.base.file.?.setEndPos(self.section_data_offset + self.offset_table_size + self.import_section_size + self.text_section_size);
         self.text_section_size_dirty = false;
     }
 
     if (self.base.options.output_mode == .Exe and self.size_of_image_dirty) {
+        // Write SizeOfImage
         const new_size_of_image = mem.alignForwardGeneric(u32, self.text_section_virtual_address - default_image_base + self.text_section_size, section_alignment);
         var buf: [4]u8 = undefined;
         mem.writeIntLittle(u32, &buf, new_size_of_image);

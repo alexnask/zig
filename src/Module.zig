@@ -273,6 +273,20 @@ pub const Decl = struct {
     }
 };
 
+/// ExternFn struct memory is owned by the Decl's TypedValue.Managed arena allocator.
+pub const ExternFn = struct {
+    owner_decl: *Decl,
+    lib_name: ?[*:0]const u8,
+
+    /// For debugging purposes.
+    pub fn dump(self: *ExternFn, mod: Module) void {
+        std.debug.print("Module.ExternFunction(name={}) ", .{self.owner_decl.name});
+        if (self.lib_name) |lib_name| {
+            std.debug.print("library name = {}\n", .{self.lib_name});
+        }
+    }
+};
+
 /// Fn struct memory is owned by the Decl's TypedValue.Managed arena allocator.
 pub const Fn = struct {
     /// This memory owned by the Decl's TypedValue.Managed arena allocator.
@@ -1003,8 +1017,19 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             defer fn_type_scope.instructions.deinit(self.gpa);
 
             decl.is_pub = fn_proto.getVisibToken() != null;
-            const body_node = fn_proto.getBodyNode() orelse
-                return self.failTok(&fn_type_scope.base, fn_proto.fn_token, "TODO implement extern functions", .{});
+
+            const is_extern = blk: {
+                if (fn_proto.getExternExportInlineToken()) |extern_export_tok| {
+                    break :blk tree.token_ids[extern_export_tok] == .Keyword_extern;
+                }
+                break :blk false;
+            };
+            if (is_extern and fn_proto.getBodyNode() != null) {
+                return self.failTok(&fn_type_scope.base, fn_proto.fn_token, "extern functions have no bodies", .{});
+            }
+            if (!is_extern and fn_proto.getBodyNode() == null) {
+                return self.failTok(&fn_type_scope.base, fn_proto.fn_token, "non-extern functions must have bodies", .{});
+            }
 
             const param_decls = fn_proto.paramsConst();
             const param_types = try fn_type_scope.arena.alloc(*zir.Inst, param_decls.len);
@@ -1022,26 +1047,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 };
                 param_types[i] = try astgen.expr(self, &fn_type_scope.base, type_type_rl, param_type_node);
             }
-            if (fn_proto.getVarArgsToken()) |var_args_token| {
-                return self.failTok(&fn_type_scope.base, var_args_token, "TODO implement var args", .{});
-            }
-            if (fn_proto.getLibName()) |lib_name| {
-                return self.failNode(&fn_type_scope.base, lib_name, "TODO implement function library name", .{});
-            }
-            if (fn_proto.getAlignExpr()) |align_expr| {
-                return self.failNode(&fn_type_scope.base, align_expr, "TODO implement function align expression", .{});
-            }
-            if (fn_proto.getSectionExpr()) |sect_expr| {
-                return self.failNode(&fn_type_scope.base, sect_expr, "TODO implement function section expression", .{});
-            }
-            if (fn_proto.getCallconvExpr()) |callconv_expr| {
-                return self.failNode(
-                    &fn_type_scope.base,
-                    callconv_expr,
-                    "TODO implement function calling convention expression",
-                    .{},
-                );
-            }
+
             const return_type_expr = switch (fn_proto.return_type) {
                 .Explicit => |node| node,
                 .InferErrorSet => |node| return self.failNode(&fn_type_scope.base, node, "TODO implement inferred error sets", .{}),
@@ -1056,6 +1062,24 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
 
             if (self.comp.verbose_ir) {
                 zir.dumpZir(self.gpa, "fn_type", decl.name, fn_type_scope.instructions.items) catch {};
+            }
+
+            if (fn_proto.getVarArgsToken()) |var_args_token| {
+                return self.failTok(&fn_type_scope.base, var_args_token, "TODO implement var args", .{});
+            }
+            if (fn_proto.getAlignExpr()) |align_expr| {
+                return self.failNode(&fn_type_scope.base, align_expr, "TODO implement function align expression", .{});
+            }
+            if (fn_proto.getSectionExpr()) |sect_expr| {
+                return self.failNode(&fn_type_scope.base, sect_expr, "TODO implement function section expression", .{});
+            }
+            if (fn_proto.getCallconvExpr()) |callconv_expr| {
+                return self.failNode(
+                    &fn_type_scope.base,
+                    callconv_expr,
+                    "TODO implement function calling convention expression",
+                    .{},
+                );
             }
 
             // We need the memory for the Type to go into the arena for the Decl
@@ -1076,101 +1100,143 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             const fn_type = try zir_sema.analyzeBodyValueAsType(self, &block_scope, fn_type_inst, .{
                 .instructions = fn_type_scope.instructions.items,
             });
-            const new_func = try decl_arena.allocator.create(Fn);
-            const fn_payload = try decl_arena.allocator.create(Value.Payload.Function);
-
-            const fn_zir = blk: {
-                // This scope's arena memory is discarded after the ZIR generation
-                // pass completes, and semantic analysis of it completes.
-                var gen_scope_arena = std.heap.ArenaAllocator.init(self.gpa);
-                errdefer gen_scope_arena.deinit();
-                var gen_scope: Scope.GenZIR = .{
-                    .decl = decl,
-                    .arena = &gen_scope_arena.allocator,
-                    .parent = decl.scope,
-                };
-                defer gen_scope.instructions.deinit(self.gpa);
-
-                // We need an instruction for each parameter, and they must be first in the body.
-                try gen_scope.instructions.resize(self.gpa, fn_proto.params_len);
-                var params_scope = &gen_scope.base;
-                for (fn_proto.params()) |param, i| {
-                    const name_token = param.name_token.?;
-                    const src = tree.token_locs[name_token].start;
-                    const param_name = tree.tokenSlice(name_token); // TODO: call identifierTokenString
-                    const arg = try gen_scope_arena.allocator.create(zir.Inst.Arg);
-                    arg.* = .{
-                        .base = .{
-                            .tag = .arg,
-                            .src = src,
-                        },
-                        .positionals = .{
-                            .name = param_name,
-                        },
-                        .kw_args = .{},
-                    };
-                    gen_scope.instructions.items[i] = &arg.base;
-                    const sub_scope = try gen_scope_arena.allocator.create(Scope.LocalVal);
-                    sub_scope.* = .{
-                        .parent = params_scope,
-                        .gen_zir = &gen_scope,
-                        .name = param_name,
-                        .inst = &arg.base,
-                    };
-                    params_scope = &sub_scope.base;
-                }
-
-                const body_block = body_node.cast(ast.Node.Block).?;
-
-                try astgen.blockExpr(self, params_scope, body_block);
-
-                if (gen_scope.instructions.items.len == 0 or
-                    !gen_scope.instructions.items[gen_scope.instructions.items.len - 1].tag.isNoReturn())
-                {
-                    const src = tree.token_locs[body_block.rbrace].start;
-                    _ = try astgen.addZIRNoOp(self, &gen_scope.base, src, .returnvoid);
-                }
-
-                if (self.comp.verbose_ir) {
-                    zir.dumpZir(self.gpa, "fn_body", decl.name, gen_scope.instructions.items) catch {};
-                }
-
-                const fn_zir = try gen_scope_arena.allocator.create(Fn.ZIR);
-                fn_zir.* = .{
-                    .body = .{
-                        .instructions = try gen_scope.arena.dupe(*zir.Inst, gen_scope.instructions.items),
-                    },
-                    .arena = gen_scope_arena.state,
-                };
-                break :blk fn_zir;
-            };
-
-            new_func.* = .{
-                .analysis = .{ .queued = fn_zir },
-                .owner_decl = decl,
-            };
-            fn_payload.* = .{ .func = new_func };
 
             var prev_type_has_bits = false;
             var type_changed = true;
+            if (is_extern) {
+                // @TODO: Check that all the argument types and the return type are C abi compatible
+                const new_func = try decl_arena.allocator.create(ExternFn);
+                const fn_payload = try decl_arena.allocator.create(Value.Payload.ExternFunction);
 
-            if (decl.typedValueManaged()) |tvm| {
-                prev_type_has_bits = tvm.typed_value.ty.hasCodeGenBits();
-                type_changed = !tvm.typed_value.ty.eql(fn_type);
+                const lib_name: ?[*:0]const u8 = blk: {
+                    if (fn_proto.getLibName()) |lib_name_node| {
+                        std.debug.assert(lib_name_node.tag == .StringLiteral);
+                        const lib_name_tok = lib_name_node.castTag(.StringLiteral).?.token;
+                        std.debug.assert(tree.token_ids[lib_name_tok] == .StringLiteral);
 
-                tvm.deinit(self.gpa);
+                        const str_lit_slice = tree.tokenSlice(lib_name_tok);
+                        break :blk try decl_arena.allocator.dupeZ(u8, str_lit_slice[1 .. str_lit_slice.len - 1]);
+                    }
+                    break :blk null;
+                };
+
+                new_func.* = .{
+                    .owner_decl = decl,
+                    .lib_name = lib_name,
+                };
+                fn_payload.* = .{ .func = new_func };
+
+                if (decl.typedValueManaged()) |tvm| {
+                    prev_type_has_bits = tvm.typed_value.ty.hasCodeGenBits();
+                    type_changed = !tvm.typed_value.ty.eql(fn_type);
+
+                    tvm.deinit(self.gpa);
+                }
+
+                decl_arena_state.* = decl_arena.state;
+                decl.typed_value = .{
+                    .most_recent = .{
+                        .typed_value = .{
+                            .ty = fn_type,
+                            .val = Value.initPayload(&fn_payload.base),
+                        },
+                        .arena = decl_arena_state,
+                    },
+                };
+            } else {
+                const body_node = fn_proto.getBodyNode().?;
+                const new_func = try decl_arena.allocator.create(Fn);
+                const fn_payload = try decl_arena.allocator.create(Value.Payload.Function);
+                const fn_zir = blk: {
+                    // This scope's arena memory is discarded after the ZIR generation
+                    // pass completes, and semantic analysis of it completes.
+                    var gen_scope_arena = std.heap.ArenaAllocator.init(self.gpa);
+                    errdefer gen_scope_arena.deinit();
+                    var gen_scope: Scope.GenZIR = .{
+                        .decl = decl,
+                        .arena = &gen_scope_arena.allocator,
+                        .parent = decl.scope,
+                    };
+                    defer gen_scope.instructions.deinit(self.gpa);
+
+                    // We need an instruction for each parameter, and they must be first in the body.
+                    try gen_scope.instructions.resize(self.gpa, fn_proto.params_len);
+                    var params_scope = &gen_scope.base;
+                    for (fn_proto.params()) |param, i| {
+                        const name_token = param.name_token.?;
+                        const src = tree.token_locs[name_token].start;
+                        const param_name = tree.tokenSlice(name_token); // TODO: call identifierTokenString
+                        const arg = try gen_scope_arena.allocator.create(zir.Inst.Arg);
+                        arg.* = .{
+                            .base = .{
+                                .tag = .arg,
+                                .src = src,
+                            },
+                            .positionals = .{
+                                .name = param_name,
+                            },
+                            .kw_args = .{},
+                        };
+                        gen_scope.instructions.items[i] = &arg.base;
+                        const sub_scope = try gen_scope_arena.allocator.create(Scope.LocalVal);
+                        sub_scope.* = .{
+                            .parent = params_scope,
+                            .gen_zir = &gen_scope,
+                            .name = param_name,
+                            .inst = &arg.base,
+                        };
+                        params_scope = &sub_scope.base;
+                    }
+
+                    const body_block = body_node.cast(ast.Node.Block).?;
+
+                    try astgen.blockExpr(self, params_scope, body_block);
+
+                    if (gen_scope.instructions.items.len == 0 or
+                        !gen_scope.instructions.items[gen_scope.instructions.items.len - 1].tag.isNoReturn())
+                    {
+                        const src = tree.token_locs[body_block.rbrace].start;
+                        _ = try astgen.addZIRNoOp(self, &gen_scope.base, src, .returnvoid);
+                    }
+
+                    if (self.comp.verbose_ir) {
+                        zir.dumpZir(self.gpa, "fn_body", decl.name, gen_scope.instructions.items) catch {};
+                    }
+
+                    const fn_zir = try gen_scope_arena.allocator.create(Fn.ZIR);
+                    fn_zir.* = .{
+                        .body = .{
+                            .instructions = try gen_scope.arena.dupe(*zir.Inst, gen_scope.instructions.items),
+                        },
+                        .arena = gen_scope_arena.state,
+                    };
+                    break :blk fn_zir;
+                };
+                new_func.* = .{
+                    .analysis = .{ .queued = fn_zir },
+                    .owner_decl = decl,
+                };
+                fn_payload.* = .{ .func = new_func };
+
+                if (decl.typedValueManaged()) |tvm| {
+                    prev_type_has_bits = tvm.typed_value.ty.hasCodeGenBits();
+                    type_changed = !tvm.typed_value.ty.eql(fn_type);
+
+                    tvm.deinit(self.gpa);
+                }
+
+                decl_arena_state.* = decl_arena.state;
+                decl.typed_value = .{
+                    .most_recent = .{
+                        .typed_value = .{
+                            .ty = fn_type,
+                            .val = Value.initPayload(&fn_payload.base),
+                        },
+                        .arena = decl_arena_state,
+                    },
+                };
             }
 
-            decl_arena_state.* = decl_arena.state;
-            decl.typed_value = .{
-                .most_recent = .{
-                    .typed_value = .{
-                        .ty = fn_type,
-                        .val = Value.initPayload(&fn_payload.base),
-                    },
-                    .arena = decl_arena_state,
-                },
-            };
             decl.analysis = .complete;
             decl.generation = self.generation;
 

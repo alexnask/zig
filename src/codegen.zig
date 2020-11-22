@@ -427,8 +427,10 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             code: *std.ArrayList(u8),
             debug_output: DebugInfoOutput,
         ) GenerateSymbolError!Result {
-            const module_fn = typed_value.val.cast(Value.Payload.Function).?.func;
+            // @TODO Probably a bad solution
+            if (typed_value.val.tag() == .extern_function) return Result{ .appended = {} };
 
+            const module_fn = typed_value.val.cast(Value.Payload.Function).?.func;
             const fn_type = module_fn.owner_decl.typed_value.most_recent.typed_value.ty;
 
             var branch_stack = std.ArrayList(Branch).init(bin_file.allocator);
