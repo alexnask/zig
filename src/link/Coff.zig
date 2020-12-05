@@ -1418,7 +1418,7 @@ pub fn updateDeclLineNumber(self: *Coff, module: *Module, decl: *Module.Decl) !v
 fn addImportDirectoryEntry(self: *Coff, decl_lib_name: []const u8, text_block: *TextBlock) !void {
     assert(mem.isAlignedGeneric(u32, self.sections.idata.raw_size, 1024));
     const ptr_bytes = switch (self.ptr_width) {
-        .p32 => @as(u3, 4),
+        .p32 => @as(u4, 4),
         .p64 => 8,
     };
 
@@ -1434,7 +1434,7 @@ fn addImportDirectoryEntry(self: *Coff, decl_lib_name: []const u8, text_block: *
     var needs_resize = false;
     var new_entry: *Entry = undefined;
     // @TODO Get index of entry instead
-    if (self.import_directory_entries.getEntry(decl_lib_name)) |*entry| {
+    if (self.import_directory_entries.getEntry(decl_lib_name)) |entry| {
         // @TODO Do this after file writes
         try entry.value.ensureCapacity(self.base.allocator, entry.value.items.len + 1);
         entry.value.appendAssumeCapacity(text_block);
