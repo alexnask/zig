@@ -1216,7 +1216,7 @@ pub const LibExeObjStep = struct {
     emit_bin: bool = true,
     emit_docs: bool = false,
     emit_h: bool = false,
-    bundle_compiler_rt: bool,
+    bundle_compiler_rt: ?bool = null,
     disable_stack_probing: bool,
     disable_sanitize_c: bool,
     rdynamic: bool,
@@ -1285,6 +1285,9 @@ pub const LibExeObjStep = struct {
 
     /// Position Independent Code
     force_pic: ?bool = null,
+
+    /// Position Independent Executable
+    pie: ?bool = null,
 
     subsystem: ?builtin.SubSystem = null,
 
@@ -1392,7 +1395,6 @@ pub const LibExeObjStep = struct {
             .exec_cmd_args = null,
             .name_prefix = "",
             .filter = null,
-            .bundle_compiler_rt = false,
             .disable_stack_probing = false,
             .disable_sanitize_c = false,
             .rdynamic = false,
@@ -1430,24 +1432,24 @@ pub const LibExeObjStep = struct {
                 self.out_lib_filename = self.out_filename;
             } else if (self.version) |version| {
                 if (target.isDarwin()) {
-                    self.major_only_filename = self.builder.fmt("lib{}.{d}.dylib", .{
+                    self.major_only_filename = self.builder.fmt("lib{s}.{d}.dylib", .{
                         self.name,
                         version.major,
                     });
-                    self.name_only_filename = self.builder.fmt("lib{}.dylib", .{self.name});
+                    self.name_only_filename = self.builder.fmt("lib{s}.dylib", .{self.name});
                     self.out_lib_filename = self.out_filename;
                 } else if (target.os.tag == .windows) {
-                    self.out_lib_filename = self.builder.fmt("{}.lib", .{self.name});
+                    self.out_lib_filename = self.builder.fmt("{s}.lib", .{self.name});
                 } else {
-                    self.major_only_filename = self.builder.fmt("lib{}.so.{d}", .{ self.name, version.major });
-                    self.name_only_filename = self.builder.fmt("lib{}.so", .{self.name});
+                    self.major_only_filename = self.builder.fmt("lib{s}.so.{d}", .{ self.name, version.major });
+                    self.name_only_filename = self.builder.fmt("lib{s}.so", .{self.name});
                     self.out_lib_filename = self.out_filename;
                 }
             } else {
                 if (target.isDarwin()) {
                     self.out_lib_filename = self.out_filename;
                 } else if (target.os.tag == .windows) {
-                    self.out_lib_filename = self.builder.fmt("{}.lib", .{self.name});
+                    self.out_lib_filename = self.builder.fmt("{s}.lib", .{self.name});
                 } else {
                     self.out_lib_filename = self.out_filename;
                 }
@@ -1806,6 +1808,29 @@ pub const LibExeObjStep = struct {
                 }
                 return;
             },
+            std.SemanticVersion => {
+                out.print(
+                    \\pub const {z}: @import("std").SemanticVersion = .{{
+                    \\    .major = {d},
+                    \\    .minor = {d},
+                    \\    .patch = {d},
+                    \\
+                , .{
+                    name,
+
+                    value.major,
+                    value.minor,
+                    value.patch,
+                }) catch unreachable;
+                if (value.pre) |some| {
+                    out.print("    .pre = \"{Z}\",\n", .{some}) catch unreachable;
+                }
+                if (value.build) |some| {
+                    out.print("    .build = \"{Z}\",\n", .{some}) catch unreachable;
+                }
+                out.writeAll("};\n") catch unreachable;
+                return;
+            },
             else => {},
         }
         switch (@typeInfo(T)) {
@@ -1978,13 +2003,10 @@ pub const LibExeObjStep = struct {
                         try zig_args.append(other.getOutputPath());
                     },
                     .Lib => {
-                        if (!other.is_dynamic or self.target.isWindows()) {
-                            try zig_args.append(other.getOutputLibPath());
-                        } else {
-                            const full_path_lib = other.getOutputPath();
-                            try zig_args.append("--library");
-                            try zig_args.append(full_path_lib);
+                        const full_path_lib = other.getOutputLibPath();
+                        try zig_args.append(full_path_lib);
 
+                        if (other.is_dynamic and !self.target.isWindows()) {
                             if (fs.path.dirname(full_path_lib)) |dirname| {
                                 try zig_args.append("-rpath");
                                 try zig_args.append(dirname);
@@ -2117,8 +2139,12 @@ pub const LibExeObjStep = struct {
         if (self.is_dynamic) {
             try zig_args.append("-dynamic");
         }
-        if (self.bundle_compiler_rt) {
-            try zig_args.append("--bundle-compiler-rt");
+        if (self.bundle_compiler_rt) |x| {
+            if (x) {
+                try zig_args.append("-fcompiler-rt");
+            } else {
+                try zig_args.append("-fno-compiler-rt");
+            }
         }
         if (self.disable_stack_probing) {
             try zig_args.append("-fno-stack-check");
@@ -2304,6 +2330,14 @@ pub const LibExeObjStep = struct {
                 try zig_args.append("-fPIC");
             } else {
                 try zig_args.append("-fno-PIC");
+            }
+        }
+
+        if (self.pie) |pie| {
+            if (pie) {
+                try zig_args.append("-fPIE");
+            } else {
+                try zig_args.append("-fno-PIE");
             }
         }
 
@@ -2763,12 +2797,20 @@ test "LibExeObjStep.addBuildOption" {
     exe.addBuildOption(?usize, "option2", null);
     exe.addBuildOption([]const u8, "string", "zigisthebest");
     exe.addBuildOption(?[]const u8, "optional_string", null);
+    exe.addBuildOption(std.SemanticVersion, "semantic_version", try std.SemanticVersion.parse("0.1.2-foo+bar"));
 
     std.testing.expectEqualStrings(
         \\pub const option1: usize = 1;
         \\pub const option2: ?usize = null;
         \\pub const string: []const u8 = "zigisthebest";
         \\pub const optional_string: ?[]const u8 = null;
+        \\pub const semantic_version: @import("std").SemanticVersion = .{
+        \\    .major = 0,
+        \\    .minor = 1,
+        \\    .patch = 2,
+        \\    .pre = "foo",
+        \\    .build = "bar",
+        \\};
         \\
     , exe.build_options_contents.items);
 }

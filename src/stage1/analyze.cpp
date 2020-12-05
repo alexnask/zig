@@ -3539,7 +3539,29 @@ static Error resolve_union_zero_bits(CodeGen *g, ZigType *union_type) {
         union_type->abi_size = SIZE_MAX;
         union_type->size_in_bits = SIZE_MAX;
     }
-    union_type->data.unionation.resolve_status = zero_bits ? ResolveStatusSizeKnown : ResolveStatusZeroBitsKnown;
+
+    if (zero_bits) {
+        // Don't forget to resolve the types for each union member even though
+        // the type is zero sized.
+        // XXX: Do it in a nicer way in stage2.
+        union_type->data.unionation.resolve_loop_flag_other = true;
+
+        for (uint32_t i = 0; i < field_count; i += 1) {
+            TypeUnionField *union_field = &union_type->data.unionation.fields[i];
+            ZigType *field_type = resolve_union_field_type(g, union_field);
+            if (field_type == nullptr) {
+                union_type->data.unionation.resolve_status = ResolveStatusInvalid;
+                return ErrorSemanticAnalyzeFail;
+            }
+        }
+
+        union_type->data.unionation.resolve_loop_flag_other = false;
+        union_type->data.unionation.resolve_status = ResolveStatusSizeKnown;
+
+        return ErrorNone;
+    }
+
+    union_type->data.unionation.resolve_status = ResolveStatusZeroBitsKnown;
 
     return ErrorNone;
 }
@@ -4445,7 +4467,7 @@ void resolve_top_level_decl(CodeGen *g, Tld *tld, AstNode *source_node, bool all
     }
 }
 
-Tld *find_container_decl(CodeGen *g, ScopeDecls *decls_scope, Buf *name) {
+void resolve_container_usingnamespace_decls(CodeGen *g, ScopeDecls *decls_scope) {
     // resolve all the using_namespace decls
     for (size_t i = 0; i < decls_scope->use_decls.length; i += 1) {
         TldUsingNamespace *tld_using_namespace = decls_scope->use_decls.at(i);
@@ -4455,6 +4477,10 @@ Tld *find_container_decl(CodeGen *g, ScopeDecls *decls_scope, Buf *name) {
         }
     }
 
+}
+
+Tld *find_container_decl(CodeGen *g, ScopeDecls *decls_scope, Buf *name) {
+    resolve_container_usingnamespace_decls(g, decls_scope);
     auto entry = decls_scope->decl_table.maybe_get(name);
     return (entry == nullptr) ? nullptr : entry->value;
 }
