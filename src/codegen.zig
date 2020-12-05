@@ -427,9 +427,6 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             code: *std.ArrayList(u8),
             debug_output: DebugInfoOutput,
         ) GenerateSymbolError!Result {
-            // @TODO Probably a bad solution
-            if (typed_value.val.tag() == .extern_function) return Result{ .appended = {} };
-
             const module_fn = typed_value.val.cast(Value.Payload.Function).?.func;
             const fn_type = module_fn.owner_decl.typed_value.most_recent.typed_value.ty;
 
@@ -1442,7 +1439,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                     const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
                                     break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
                                 } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    @intCast(u32, coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes)
+                                    @intCast(u32, coff_file.sections.got.virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes)
                                 else
                                     unreachable;
 
@@ -1470,7 +1467,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                     const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
                                     break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
                                 } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
+                                    coff_file.sections.got.virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
                                 else
                                     unreachable;
 
@@ -1494,7 +1491,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                     const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
                                     break :blk @intCast(u16, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * 2);
                                 } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    @intCast(u16, coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * 2)
+                                    @intCast(u16, coff_file.sections.got.virtual_address + func.owner_decl.link.coff.offset_table_index * 2)
                                 else
                                     unreachable;
 
@@ -1567,7 +1564,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                     const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
                                     break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
                                 } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
+                                    coff_file.sections.got.virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
                                 else
                                     unreachable;
 
@@ -1628,7 +1625,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                     const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
                                     break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
                                 } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
+                                    coff_file.sections.got.virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
                                 else
                                     unreachable;
 
@@ -2935,7 +2932,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                             return MCValue{ .memory = got_addr };
                         } else if (self.bin_file.cast(link.File.Coff)) |coff_file| {
                             const decl = payload.decl;
-                            const got_addr = coff_file.offset_table_virtual_address + decl.link.coff.offset_table_index * ptr_bytes;
+                            const got_addr = coff_file.sections.got.virtual_address + decl.link.coff.offset_table_index * ptr_bytes;
                             return MCValue{ .memory = got_addr };
                         } else {
                             return self.fail(src, "TODO codegen non-ELF const Decl pointer", .{});

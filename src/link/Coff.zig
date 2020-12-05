@@ -18,6 +18,25 @@ const Cache = @import("../Cache.zig");
 const mingw = @import("../mingw.zig");
 const Value = @import("../value.zig").Value;
 
+// @TODO Keep pointers to the pointers in the GOT, 1 extra indirection when
+// is_extern
+//              vvvv GOT indexes
+// {dll_name => [usize]}
+
+const Section = struct {
+    /// Absolute virtual address of the section when the binary is loaded in memory.
+    virtual_address: u32 = 0,
+    /// Raw size of the section on disk (aligned to `file_alignment`)
+    raw_size: u32 = 0,
+    /// Wether the size of the section changed since the last flush
+    size_dirty: bool = false,
+
+    /// Get relative virtual address to the section
+    fn getRVA(self: @This(), coff: Coff) u32 {
+        return self.virtual_address - coff.image_base;
+    }
+};
+
 const allocation_padding = 4 / 3;
 const minimum_text_block_size = 64 * allocation_padding;
 
@@ -27,7 +46,7 @@ const file_alignment = 512;
 const data_directory_count = 16;
 
 const default_offset_table_size = std.math.max(512, file_alignment);
-const default_import_section_size = std.math.max(512, file_alignment);
+const default_import_section_size = std.math.max(1024, file_alignment);
 
 const default_size_of_code = 0;
 const default_image_base = 0x400_000;
@@ -48,6 +67,8 @@ error_flags: link.File.ErrorFlags = .{},
 text_block_free_list: std.ArrayListUnmanaged(*TextBlock) = .{},
 last_text_block: ?*TextBlock = null,
 
+/// Base address the image will be loaded starting in
+image_base: u32 = default_image_base,
 /// Virtual address of the entry point procedure relative to image base.
 entry_addr: ?u32 = null,
 
@@ -58,28 +79,27 @@ section_data_offset: u32 = 0,
 /// Optiona header file pointer.
 optional_header_offset: u32 = 0,
 
-/// Absolute virtual address of the offset table when the executable is loaded in memory.
-offset_table_virtual_address: u32 = 0,
-/// Current size of the offset table on disk, must be a multiple of `file_alignment`
-offset_table_size: u32 = 0,
+sections: struct {
+    /// Global offset table section
+    got: Section = .{},
+    /// Import directory section
+    idata: Section = .{},
+    /// Code and data section
+    text: Section = .{},
+} = .{},
+
 /// Contains absolute virtual addresses
 offset_table: std.ArrayListUnmanaged(u64) = .{},
 /// Free list of offset table indices
 offset_table_free_list: std.ArrayListUnmanaged(u32) = .{},
 
-/// Absolute virtual address of the import section when the executable is loaded in memory.
-import_section_virtual_address: u32 = 0,
-/// Current size of the `.idata` section on disk, must be a multiple of `file_alignment`
-import_section_size: u32 = 0,
+/// TextBlocks backing extern declarations that end up in .idata by extern lib_name
+import_directory_entries: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(*TextBlock)) = .{},
+/// Used number of entries in the lookup table, including zero sentinels
+lookup_table_entries_used: usize = 0,
+/// Amount of bytes used in the .idata string data storage
+idata_string_bytes_used: usize = 0,
 
-/// Absolute virtual address of the text section when the executable is loaded in memory.
-text_section_virtual_address: u32 = 0,
-/// Current size of the `.text` section on disk, must be a multiple of `file_alignment`
-text_section_size: u32 = 0,
-
-offset_table_size_dirty: bool = false,
-import_section_size_dirty: bool = false,
-text_section_size_dirty: bool = false,
 /// This flag is set when the virtual size of the whole image file when loaded in memory has changed
 /// and needs to be updated in the optional header.
 size_of_image_dirty: bool = false,
@@ -127,7 +147,7 @@ pub const TextBlock = struct {
 
     /// Absolute virtual address of the text block when the file is loaded in memory.
     fn getVAddr(self: TextBlock, coff: Coff) u32 {
-        return coff.text_section_virtual_address + self.text_offset;
+        return coff.sections.text.virtual_address + self.text_offset;
     }
 };
 
@@ -191,18 +211,21 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
         else => 0,
     };
 
+    // @TODO Zero out .idata
+    // 8 entries per KiB, last entry is always a zero sentinel.
+    self.lookup_table_entries_used = 8 * (default_import_section_size / 1024) - 1;
     self.section_table_offset = coff_file_header_offset + 20 + optional_header_size;
     self.section_data_offset = mem.alignForwardGeneric(u32, self.section_table_offset + section_table_size, file_alignment);
     const section_data_relative_virtual_address = mem.alignForwardGeneric(u32, self.section_table_offset + section_table_size, section_alignment);
-    self.offset_table_virtual_address = default_image_base + section_data_relative_virtual_address;
-    self.offset_table_size = default_offset_table_size;
-    self.import_section_virtual_address = default_image_base + section_data_relative_virtual_address + section_alignment;
-    self.import_section_size = default_import_section_size;
-    self.text_section_virtual_address = default_image_base + section_data_relative_virtual_address + 2 * section_alignment;
-    self.text_section_size = default_size_of_code;
+    self.sections.got.virtual_address = self.image_base + section_data_relative_virtual_address;
+    self.sections.got.raw_size = default_offset_table_size;
+    self.sections.idata.virtual_address = self.image_base + section_data_relative_virtual_address + section_alignment;
+    self.sections.idata.raw_size = default_import_section_size;
+    self.sections.text.virtual_address = self.image_base + section_data_relative_virtual_address + 2 * section_alignment;
+    self.sections.text.raw_size = default_size_of_code;
 
     // Size of file when loaded in memory
-    const size_of_image = mem.alignForwardGeneric(u32, self.text_section_virtual_address - default_image_base + default_size_of_code, section_alignment);
+    const size_of_image = mem.alignForwardGeneric(u32, self.sections.text.getRVA(self.*) + default_size_of_code, section_alignment);
 
     mem.writeIntLittle(u16, hdr_data[index..][0..2], optional_header_size);
     index += 2;
@@ -246,11 +269,11 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
             index += 4;
 
             // Image base address
-            mem.writeIntLittle(u32, hdr_data[index..][0..4], default_image_base);
+            mem.writeIntLittle(u32, hdr_data[index..][0..4], self.image_base);
             index += 4;
         } else {
             // Image base address
-            mem.writeIntLittle(u64, hdr_data[index..][0..8], default_image_base);
+            mem.writeIntLittle(u64, hdr_data[index..][0..8], self.image_base);
             index += 8;
         }
 
@@ -344,7 +367,7 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
         );
         index += 4;
         // Virtual address (u32)
-        mem.writeIntLittle(u32, hdr_data[index..][0..4], self.offset_table_virtual_address - default_image_base);
+        mem.writeIntLittle(u32, hdr_data[index..][0..4], self.sections.got.getRVA(self.*));
         index += 4;
     } else {
         mem.set(u8, hdr_data[index..][0..8], 0);
@@ -374,7 +397,7 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
         );
         index += 4;
         // Virtual address (u32)
-        mem.writeIntLittle(u32, hdr_data[index..][0..4], self.import_section_virtual_address - default_image_base);
+        mem.writeIntLittle(u32, hdr_data[index..][0..4], self.sections.idata.getRVA(self.*));
         index += 4;
     } else {
         mem.set(u8, hdr_data[index..][0..8], 0);
@@ -404,7 +427,7 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
         mem.writeIntLittle(u32, hdr_data[index..][0..4], default_size_of_code);
         index += 4;
         // Virtual address (u32)
-        mem.writeIntLittle(u32, hdr_data[index..][0..4], self.text_section_virtual_address - default_image_base);
+        mem.writeIntLittle(u32, hdr_data[index..][0..4], self.sections.text.getRVA(self.*));
         index += 4;
     } else {
         mem.set(u8, hdr_data[index..][0..8], 0);
@@ -453,12 +476,63 @@ pub fn createEmpty(gpa: *Allocator, options: link.Options) !*Coff {
     return self;
 }
 
-pub fn allocateDeclIndexes(self: *Coff, decl: *Module.Decl) !void {
+pub fn allocateDeclIndexes(self: *Coff, module: *Module, decl: *Module.Decl) !void {
+    // TODO Support extern variable declarations as well
     const typed_value = decl.typed_value.most_recent.typed_value;
     if (typed_value.val.cast(Value.Payload.ExternFunction)) |extern_func| {
-        // @TODO
-        log.crit("TODO extern functions in COFF linker", .{});
-        std.process.exit(1);
+        if (extern_func.func.lib_name == null) {
+            try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
+            module.failed_decls.putAssumeCapacityNoClobber(decl, try Compilation.ErrorMsg.create(
+                module.gpa,
+                decl.src(),
+                "TODO implement extern functions with no library name in COFF linker",
+                .{},
+            ));
+            return error.AnalysisFail;
+        }
+
+        // @TODO: Just add to table here, then in updateDecl when the got index is zero
+        // also do all this stuff (also prob removes the need for module param)
+        const decl_lib_name = mem.span(extern_func.func.lib_name.?);
+        var arena = std.heap.ArenaAllocator.init(self.base.allocator);
+        defer arena.deinit();
+
+        const found = findInDef(module, &arena, decl_lib_name, mem.span(decl.name)) catch |err| switch (err) {
+            error.FileNotFound => {
+                // TODO: link against .lib files
+                try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
+                module.failed_decls.putAssumeCapacityNoClobber(decl, try Compilation.ErrorMsg.create(
+                    module.gpa,
+                    decl.src(),
+                    "could not find default windows .def file for library '{}'",
+                    .{decl_lib_name},
+                ));
+                return error.AnalysisFail;
+            },
+            error.OutOfMemory => |e| return e,
+            else => |e| {
+                try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
+                module.failed_decls.putAssumeCapacityNoClobber(decl, try Compilation.ErrorMsg.create(
+                    module.gpa,
+                    decl.src(),
+                    "failed while looking for a symbol in a default '{}.def' file with error {}",
+                    .{ decl_lib_name, @errorName(e) },
+                ));
+                return error.AnalysisFail;
+            },
+        };
+        if (!found) {
+            try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
+            module.failed_decls.putAssumeCapacityNoClobber(decl, try Compilation.ErrorMsg.create(
+                module.gpa,
+                decl.src(),
+                "Could not find symbol '{}' in library '{}'",
+                .{ decl.name, decl_lib_name },
+            ));
+            return error.AnalysisFail;
+        }
+
+        try self.addImportDirectoryEntry(decl_lib_name, &decl.link.coff);
     }
 
     try self.offset_table.ensureCapacity(self.base.allocator, self.offset_table.items.len + 1);
@@ -470,8 +544,8 @@ pub fn allocateDeclIndexes(self: *Coff, decl: *Module.Decl) !void {
         _ = self.offset_table.addOneAssumeCapacity();
 
         const entry_size = self.base.options.target.cpu.arch.ptrBitWidth() / 8;
-        if (self.offset_table.items.len > self.offset_table_size / entry_size) {
-            self.offset_table_size_dirty = true;
+        if (self.offset_table.items.len > self.sections.got.raw_size / entry_size) {
+            self.sections.got.size_dirty = true;
         }
     }
 
@@ -495,7 +569,7 @@ fn allocateTextBlock(self: *Coff, text_block: *TextBlock, new_block_size: u64, a
             const free_block = self.text_block_free_list.items[i];
 
             const next_block_text_offset = free_block.text_offset + free_block.capacity();
-            const new_block_text_offset = mem.alignForwardGeneric(u64, free_block.getVAddr(self.*) + free_block.size, alignment) - self.text_section_virtual_address;
+            const new_block_text_offset = mem.alignForwardGeneric(u64, free_block.getVAddr(self.*) + free_block.size, alignment) - self.sections.text.virtual_address;
             if (new_block_text_offset < next_block_text_offset and next_block_text_offset - new_block_text_offset >= new_block_min_capacity) {
                 block_placement = free_block;
 
@@ -504,7 +578,7 @@ fn allocateTextBlock(self: *Coff, text_block: *TextBlock, new_block_size: u64, a
                     free_list_removal = i;
                 }
 
-                break :blk new_block_text_offset + self.text_section_virtual_address;
+                break :blk new_block_text_offset + self.sections.text.virtual_address;
             } else {
                 if (!free_block.freeListEligible()) {
                     _ = self.text_block_free_list.swapRemove(i);
@@ -518,15 +592,19 @@ fn allocateTextBlock(self: *Coff, text_block: *TextBlock, new_block_size: u64, a
             block_placement = last;
             break :blk new_block_vaddr;
         } else {
-            break :blk self.text_section_virtual_address;
+            break :blk self.sections.text.virtual_address;
         }
     };
 
     const expand_text_section = block_placement == null or block_placement.?.next == null;
     if (expand_text_section) {
-        const needed_size = @intCast(u32, mem.alignForwardGeneric(u64, vaddr + new_block_size - self.text_section_virtual_address, file_alignment));
-        if (needed_size > self.text_section_size) {
-            const current_text_section_virtual_size = mem.alignForwardGeneric(u32, self.text_section_size, section_alignment);
+        const needed_size = @intCast(u32, mem.alignForwardGeneric(
+            u64,
+            vaddr + new_block_size - self.sections.text.virtual_address,
+            file_alignment,
+        ));
+        if (needed_size > self.sections.text.raw_size) {
+            const current_text_section_virtual_size = mem.alignForwardGeneric(u32, self.sections.text.raw_size, section_alignment);
             const new_text_section_virtual_size = mem.alignForwardGeneric(u32, needed_size, section_alignment);
             if (current_text_section_virtual_size != new_text_section_virtual_size) {
                 self.size_of_image_dirty = true;
@@ -537,16 +615,16 @@ fn allocateTextBlock(self: *Coff, text_block: *TextBlock, new_block_size: u64, a
             }
 
             log.debug(".text section resized: {Bi} (virtual size: {Bi}) -> {Bi} (virtual size: {Bi})", .{
-                self.text_section_size, current_text_section_virtual_size,
-                needed_size,            new_text_section_virtual_size,
+                self.sections.text.raw_size, current_text_section_virtual_size,
+                needed_size,                 new_text_section_virtual_size,
             });
 
-            self.text_section_size = needed_size;
-            self.text_section_size_dirty = true;
+            self.sections.text.raw_size = needed_size;
+            self.sections.text.size_dirty = true;
         }
         self.last_text_block = text_block;
     }
-    text_block.text_offset = @intCast(u32, vaddr - self.text_section_virtual_address);
+    text_block.text_offset = @intCast(u32, vaddr - self.sections.text.virtual_address);
     text_block.size = @intCast(u32, new_block_size);
 
     // This function can also reallocate a text block.
@@ -627,9 +705,9 @@ fn writeOffsetTableEntry(self: *Coff, index: usize) !void {
     const endian = self.base.options.target.cpu.arch.endian();
 
     const offset_table_start = self.section_data_offset;
-    if (self.offset_table_size_dirty) {
-        const current_raw_size = self.offset_table_size;
-        const new_raw_size = self.offset_table_size * 2;
+    if (self.sections.got.size_dirty) {
+        const current_raw_size = self.sections.got.raw_size;
+        const new_raw_size = current_raw_size * 2;
         log.debug("growing offset table from raw size {} to {}\n", .{ current_raw_size, new_raw_size });
 
         // Move the idata and text sections to a new place in the executable
@@ -640,9 +718,9 @@ fn writeOffsetTableEntry(self: *Coff, index: usize) !void {
             current_idata_section_start,
             self.base.file.?,
             new_idata_section_start,
-            self.import_section_size + self.text_section_size,
+            self.sections.idata.raw_size + self.sections.text.raw_size,
         );
-        if (amt != self.import_section_size + self.text_section_size) return error.InputOutput;
+        if (amt != self.sections.idata.raw_size + self.sections.text.raw_size) return error.InputOutput;
 
         // Write the new raw size in the .got header
         var buf: [8]u8 = undefined;
@@ -652,10 +730,10 @@ fn writeOffsetTableEntry(self: *Coff, index: usize) !void {
         mem.writeIntLittle(u32, buf[0..4], new_idata_section_start);
         try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 40 + 20);
         // Write the new .text section file offset in the .text section header
-        mem.writeIntLittle(u32, buf[0..4], new_idata_section_start + self.import_section_size);
+        mem.writeIntLittle(u32, buf[0..4], new_idata_section_start + self.sections.idata.raw_size);
         try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 2 * 40 + 20);
 
-        const current_virtual_size = mem.alignForwardGeneric(u32, self.offset_table_size, section_alignment);
+        const current_virtual_size = mem.alignForwardGeneric(u32, self.sections.got.raw_size, section_alignment);
         const new_virtual_size = mem.alignForwardGeneric(u32, new_raw_size, section_alignment);
         // If we had to move in the virtual address space, we need to fix the VAs in the offset table, as well as the virtual address of the `.text` section
         // and the virutal size of the `.got` section
@@ -670,13 +748,13 @@ fn writeOffsetTableEntry(self: *Coff, index: usize) !void {
             try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 8);
 
             // Write .idata new virtual address
-            self.import_section_virtual_address = self.import_section_virtual_address + va_offset;
-            mem.writeIntLittle(u32, buf[0..4], self.import_section_virtual_address - default_image_base);
+            self.sections.got.virtual_address += va_offset;
+            mem.writeIntLittle(u32, buf[0..4], self.sections.got.getRVA(self.*));
             try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 40 + 12);
 
             // Write .text new virtual address
-            self.text_section_virtual_address = self.text_section_virtual_address + va_offset;
-            mem.writeIntLittle(u32, buf[0..4], self.text_section_virtual_address - default_image_base);
+            self.sections.text.virtual_address += va_offset;
+            mem.writeIntLittle(u32, buf[0..4], self.sections.text.getRVA(self.*));
             try self.base.file.?.pwriteAll(buf[0..4], self.section_table_offset + 2 * 40 + 12);
 
             // Fix the VAs in the offset table
@@ -698,8 +776,8 @@ fn writeOffsetTableEntry(self: *Coff, index: usize) !void {
                 }
             }
         }
-        self.offset_table_size = new_raw_size;
-        self.offset_table_size_dirty = false;
+        self.sections.got.raw_size = new_raw_size;
+        self.sections.got.size_dirty = false;
     }
     // Write the new entry
     switch (entry_size) {
@@ -738,6 +816,11 @@ pub fn updateDecl(self: *Coff, module: *Module, decl: *Module.Decl) !void {
         },
     };
 
+    // TODO Support extern variable declarations as well
+    const is_extern = typed_value.val.tag() == .extern_function;
+    // Nothing to do for extern symbols.
+    if (is_extern) return;
+
     const required_alignment = typed_value.ty.abiAlignment(self.base.options.target);
     const curr_size = decl.link.coff.size;
     if (curr_size != 0) {
@@ -767,7 +850,8 @@ pub fn updateDecl(self: *Coff, module: *Module, decl: *Module.Decl) !void {
     // Write the code into the file
     try self.base.file.?.pwriteAll(
         code,
-        self.section_data_offset + self.offset_table_size + self.import_section_size + decl.link.coff.text_offset,
+        self.section_data_offset + self.sections.got.raw_size +
+            self.sections.idata.raw_size + decl.link.coff.text_offset,
     );
 
     // Since we updated the vaddr and the size, each corresponding export symbol also needs to be updated.
@@ -776,6 +860,13 @@ pub fn updateDecl(self: *Coff, module: *Module, decl: *Module.Decl) !void {
 }
 
 pub fn freeDecl(self: *Coff, decl: *Module.Decl) void {
+    // TODO Support extern variable declarations as well
+    const is_extern = decl.typed_value.most_recent.typed_value.val.tag() == .extern_function;
+    if (is_extern) {
+        // @TODO Remove from import table
+        return;
+    }
+
     // Appending to free lists is allowed to fail because the free lists are heuristics based anyway.
     self.freeTextBlock(&decl.link.coff);
     self.offset_table_free_list.append(self.base.allocator, decl.link.coff.offset_table_index) catch {};
@@ -794,7 +885,7 @@ pub fn updateDeclExports(self: *Coff, module: *Module, decl: *const Module.Decl,
             }
         }
         if (mem.eql(u8, exp.options.name, "_start")) {
-            self.entry_addr = decl.link.coff.getVAddr(self.*) - default_image_base;
+            self.entry_addr = decl.link.coff.getVAddr(self.*) - self.image_base;
         } else {
             try module.failed_exports.ensureCapacity(module.gpa, module.failed_exports.items().len + 1);
             module.failed_exports.putAssumeCapacityNoClobber(
@@ -822,26 +913,34 @@ pub fn flushModule(self: *Coff, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
-    if (self.import_section_size_dirty) {
+    // @TODO Check if we need this here or some other place
+    if (self.sections.idata.size_dirty) {
         // Write the new raw size in the .idata header
         var buf: [4]u8 = undefined;
-        mem.writeIntLittle(u32, &buf, self.import_section_size);
+        mem.writeIntLittle(u32, &buf, self.sections.idata.raw_size);
         try self.base.file.?.pwriteAll(&buf, self.section_table_offset + 40 + 16);
-        self.import_section_size_dirty = false;
+        self.sections.idata.size_dirty = false;
     }
 
-    if (self.text_section_size_dirty) {
+    if (self.sections.text.size_dirty) {
         // Write the new raw size in the .text header
         var buf: [4]u8 = undefined;
-        mem.writeIntLittle(u32, &buf, self.text_section_size);
+        mem.writeIntLittle(u32, &buf, self.sections.text.raw_size);
         try self.base.file.?.pwriteAll(&buf, self.section_table_offset + 2 * 40 + 16);
-        try self.base.file.?.setEndPos(self.section_data_offset + self.offset_table_size + self.import_section_size + self.text_section_size);
-        self.text_section_size_dirty = false;
+        try self.base.file.?.setEndPos(
+            self.section_data_offset + self.sections.got.raw_size +
+                self.sections.idata.raw_size + self.sections.text.raw_size,
+        );
+        self.sections.text.size_dirty = false;
     }
 
     if (self.base.options.output_mode == .Exe and self.size_of_image_dirty) {
         // Write SizeOfImage
-        const new_size_of_image = mem.alignForwardGeneric(u32, self.text_section_virtual_address - default_image_base + self.text_section_size, section_alignment);
+        const new_size_of_image = mem.alignForwardGeneric(
+            u32,
+            self.sections.text.getRVA(self.*) + self.sections.text.raw_size,
+            section_alignment,
+        );
         var buf: [4]u8 = undefined;
         mem.writeIntLittle(u32, &buf, new_size_of_image);
         try self.base.file.?.pwriteAll(&buf, self.optional_header_offset + 56);
@@ -1309,15 +1408,111 @@ fn append_diagnostic(context: usize, ptr: [*]const u8, len: usize) callconv(.C) 
 }
 
 pub fn getDeclVAddr(self: *Coff, decl: *const Module.Decl) u64 {
-    return self.text_section_virtual_address + decl.link.coff.text_offset;
+    return self.sections.text.virtual_address + decl.link.coff.text_offset;
 }
 
 pub fn updateDeclLineNumber(self: *Coff, module: *Module, decl: *Module.Decl) !void {
     // TODO Implement this
 }
 
+fn addImportDirectoryEntry(self: *Coff, decl_lib_name: []const u8, text_block: *TextBlock) !void {
+    assert(mem.isAlignedGeneric(u32, self.sections.idata.raw_size, 1024));
+    const ptr_bytes = switch (self.ptr_width) {
+        .p32 => @as(u3, 4),
+        .p64 => 8,
+    };
+
+    const import_chunks = @divExact(self.sections.idata.raw_size, 1024);
+    // 160 B of each 1 KiB block go to directory entires, the last one is a sentinel
+    const import_entries_max = @divExact(160 * import_chunks, 20) - 1;
+    // 256 B of each 1 KiB block go to lookup table entries (and address table entries)
+    const lookup_table_entries_max = @divExact(256 * import_chunks, ptr_bytes);
+    const string_data_size = 352 * import_chunks;
+
+    const Entry = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(*TextBlock)).Entry;
+
+    var needs_resize = false;
+    var new_entry: *Entry = undefined;
+    // @TODO Get index of entry instead
+    if (self.import_directory_entries.getEntry(decl_lib_name)) |*entry| {
+        // @TODO Do this after file writes
+        try entry.value.ensureCapacity(self.base.allocator, entry.value.items.len + 1);
+        entry.value.appendAssumeCapacity(text_block);
+
+        self.lookup_table_entries_used += 1;
+        if (self.lookup_table_entries_used >= lookup_table_entries_max) {
+            // @TODO Resize table, move everything around, adjust GOT offsets when needed
+        } else {
+            // Write stuff in the file.
+            // Move entries that come after us down, fix the GOT entries
+        }
+    } else {
+        const lib_name = try self.base.allocator.dupe(u8, decl_lib_name);
+        errdefer self.base.allocator.free(lib_name);
+
+        var text_block_list = try std.ArrayListUnmanaged(*TextBlock).initCapacity(self.base.allocator, 1);
+        errdefer text_block_list.deinit(self.base.allocator);
+        text_block_list.appendAssumeCapacity(text_block);
+
+        try self.import_directory_entries.ensureCapacity(self.base.allocator, self.import_directory_entries.count() + 1);
+        self.import_directory_entries.putAssumeCapacityNoClobber(lib_name, text_block_list);
+
+        self.lookup_table_entries_used += 1;
+        if (self.import_directory_entries.count() >= import_entries_max or
+            self.lookup_table_entries_used >= lookup_table_entries_max)
+        {
+            needs_resize = true;
+            new_entry = self.import_directory_entries.getEntry(decl_lib_name).?;
+        }
+    }
+
+    if (needs_resize) {
+        self.sections.idata.raw_size *= 2;
+        self.sections.idata.size_dirty = true;
+
+
+    }
+
+    // @TODO Do work on the file in this function, only set the size to dirty when needed
+}
+
+fn findInDef(
+    module: *Module,
+    arena: *std.heap.ArenaAllocator,
+    lib_name: []const u8,
+    decl_name: []const u8,
+) !bool {
+    const def_file_path = try mingw.findDef(module.comp, &arena.allocator, lib_name);
+
+    var def_file = try fs.cwd().openFile(def_file_path, .{});
+    defer def_file.close();
+
+    const def_file_size = try def_file.getEndPos();
+    const def_contents = try def_file.readToEndAllocOptions(
+        &arena.allocator,
+        4 * 1024 * 1024,
+        def_file_size,
+        @alignOf(u8),
+        null,
+    );
+
+    var line_it = mem.tokenize(def_contents, "\n");
+    while (line_it.next()) |line| {
+        if (line[0] == ';') continue;
+        if (mem.eql(u8, decl_name, mem.trim(u8, line, &std.ascii.spaces)))
+            return true;
+    }
+    return false;
+}
+
 pub fn deinit(self: *Coff) void {
     self.text_block_free_list.deinit(self.base.allocator);
     self.offset_table.deinit(self.base.allocator);
     self.offset_table_free_list.deinit(self.base.allocator);
+
+    for (self.import_directory_entries.items()) |*block| {
+        self.base.allocator.free(block.key);
+        block.value.deinit(self.base.allocator);
+    }
+    self.import_directory_entries.deinit(self.base.allocator);
 }

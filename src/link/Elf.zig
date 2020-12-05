@@ -2016,7 +2016,20 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
     return vaddr;
 }
 
-pub fn allocateDeclIndexes(self: *Elf, decl: *Module.Decl) !void {
+pub fn allocateDeclIndexes(self: *Elf, module: *Module, decl: *Module.Decl) !void {
+    const typed_value = decl.typed_value.most_recent.typed_value;
+    if (typed_value.val.cast(Value.Payload.ExternFunction)) |extern_func| {
+        // @TODO
+            try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
+            module.failed_decls.putAssumeCapacityNoClobber(decl, try Compilation.ErrorMsg.create(
+                module.gpa,
+                decl.src(),
+                "TODO implement extern functions in the ELF linker",
+                .{}
+            ));
+            return;
+    }
+
     if (decl.link.elf.local_sym_index != 0) return;
 
     try self.local_symbols.ensureCapacity(self.base.allocator, self.local_symbols.items.len + 1);

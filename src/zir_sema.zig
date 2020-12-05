@@ -204,7 +204,7 @@ pub fn analyzeZirDecl(mod: *Module, decl: *Decl, src_decl: *zir.Decl) InnerError
         // We don't fully codegen the decl until later, but we do need to reserve a global
         // offset table index for it. This allows us to codegen decls out of dependency order,
         // increasing how many computations can be done in parallel.
-        try mod.comp.bin_file.allocateDeclIndexes(decl);
+        try mod.comp.bin_file.allocateDeclIndexes(mod, decl);
         try mod.comp.work_queue.writeItem(.{ .codegen_decl = decl });
     } else if (prev_type_has_bits) {
         mod.comp.bin_file.freeDecl(decl);

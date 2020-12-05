@@ -435,7 +435,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
 }
 
 /// This function body is verbose but all it does is test 3 different paths and see if a .def file exists.
-fn findDef(comp: *Compilation, allocator: *Allocator, lib_name: []const u8) ![]u8 {
+pub fn findDef(comp: *Compilation, allocator: *Allocator, lib_name: []const u8) ![]u8 {
     const target = comp.getTarget();
 
     const lib_path = switch (target.cpu.arch) {

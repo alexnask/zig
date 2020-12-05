@@ -273,11 +273,11 @@ pub const File = struct {
 
     /// Must be called before any call to updateDecl or updateDeclExports for
     /// any given Decl.
-    pub fn allocateDeclIndexes(base: *File, decl: *Module.Decl) !void {
+    pub fn allocateDeclIndexes(base: *File, module: *Module, decl: *Module.Decl) !void {
         switch (base.tag) {
-            .coff => return @fieldParentPtr(Coff, "base", base).allocateDeclIndexes(decl),
-            .elf => return @fieldParentPtr(Elf, "base", base).allocateDeclIndexes(decl),
-            .macho => return @fieldParentPtr(MachO, "base", base).allocateDeclIndexes(decl),
+            .coff => return @fieldParentPtr(Coff, "base", base).allocateDeclIndexes(module, decl),
+            .elf => return @fieldParentPtr(Elf, "base", base).allocateDeclIndexes(module, decl),
+            .macho => return @fieldParentPtr(MachO, "base", base).allocateDeclIndexes(module, decl),
             .c, .wasm => {},
         }
     }

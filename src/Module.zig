@@ -1244,8 +1244,11 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 // We don't fully codegen the decl until later, but we do need to reserve a global
                 // offset table index for it. This allows us to codegen decls out of dependency order,
                 // increasing how many computations can be done in parallel.
-                try self.comp.bin_file.allocateDeclIndexes(decl);
-                try self.comp.work_queue.writeItem(.{ .codegen_decl = decl });
+                try self.comp.bin_file.allocateDeclIndexes(self, decl);
+                if (!is_extern) {
+                    // Extern functions don't need codegen.
+                    try self.comp.work_queue.writeItem(.{ .codegen_decl = decl });
+                }
             } else if (prev_type_has_bits) {
                 self.comp.bin_file.freeDecl(decl);
             }
@@ -2331,7 +2334,7 @@ pub fn createAnonymousDecl(
     // We should be able to further improve the compiler to not omit Decls which are only referenced at
     // compile-time and not runtime.
     if (typed_value.ty.hasCodeGenBits()) {
-        try self.comp.bin_file.allocateDeclIndexes(new_decl);
+        try self.comp.bin_file.allocateDeclIndexes(self, new_decl);
         try self.comp.work_queue.writeItem(.{ .codegen_decl = new_decl });
     }
 
